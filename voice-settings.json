@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"${YAPPER_ROOT:-}\" ] || exec \"${YAPPER_ROOT}/bin/voice-brief\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -z \"${YAPPER_ROOT:-}\" ] || exec \"${YAPPER_ROOT}/bin/speak-hook\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "voice": {
+    "enabled": false
+  },
+  "voiceEnabled": false
+}

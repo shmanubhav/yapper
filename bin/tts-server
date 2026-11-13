@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Resident speech server. Hugging Face stays offline unless told otherwise: `yapper --install` fetches once.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+R="$(dirname "$(dirname "$(realpath "$0")")")"
+exec "$R/bin/tts-python" "$R/lib/speaker.py"

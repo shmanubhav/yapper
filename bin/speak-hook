@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+Stop hook: speaks a short summary of the reply.
+
+Registered only in voice-settings.json, which only bin/yapper loads via --settings. A
+session that did not launch through yapper never loads this hook, so there is nothing
+here to decide whether to speak.
+
+Always exits 0 and never writes to stdout, so it cannot block continuation or be mistaken for
+hook output. Speech is an enhancement: every failure path here is silent and non-fatal.
+"""
+import json, os, re, sys, time
+
+# The engine's socket helper lives in lib/. A broken checkout must not break a turn, so a failed
+# import only means no speech.
+sys.dont_write_bytecode = True     # never write __pycache__ into the clone
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+try:
+    import speechsock
+except Exception:                                           # noqa: BLE001
+    speechsock = None
+
+LOGFILE  = os.path.expanduser(os.environ.get("YAPPER_LOG", "~/.cache/yapper/speak.log"))
+MAX_CHARS = 600           # never read an essay aloud
+# Chatterbox Turbo tags the contract allows; keep in sync with bin/voice-brief (tests/test_brief.py checks).
+ALLOWED_TAGS = ("sigh", "chuckle", "laugh", "sarcastic", "gasp", "surprised", "groan", "clear throat",
+                "whispering", "happy", "angry", "fear", "crying", "dramatic")
+_TAG = re.compile(r"\[\s*([A-Za-z][A-Za-z ]*?)\s*\]")
+
+
+def keep_known_tags(text: str) -> str:
+    """An unknown [tag] would be read aloud as words, so drop it; normalise the known ones."""
+    def one(m):
+        t = re.sub(r"\s+", " ", m.group(1)).lower()
+        return f"[{t}]" if t in ALLOWED_TAGS else ""
+    return re.sub(r"\s{2,}", " ", _TAG.sub(one, text)).strip()
+
+
+def cap_at_sentence(text: str, limit: int = MAX_CHARS) -> str:
+    """Cut at the last sentence end inside the limit; failing that, at a word, never mid-tag."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    ends = [m.end() for m in re.finditer(r"[.!?](?=\s|$)", cut)]
+    if ends:
+        return cut[:ends[-1]].strip()
+    cut = cut[:cut.rfind(" ")] if " " in cut else cut
+    if cut.rfind("[") > cut.rfind("]"):
+        cut = cut[:cut.rfind("[")]
+    return cut.strip()
+
+
+def note(msg):
+    try:
+        os.makedirs(os.path.dirname(LOGFILE), mode=0o700, exist_ok=True)
+        # 600: the log keeps the start of each spoken reply
+        with os.fdopen(os.open(LOGFILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def _scan_transcript(path: str) -> str:
+    text = ""
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("type") != "assistant":
+                    continue
+                content = e.get("message", {}).get("content", [])
+                if isinstance(content, str):
+                    text = content
+                else:
+                    parts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                    if parts:
+                        text = "\n".join(parts)
+    except OSError:
+        pass
+    return text
+
+
+def last_assistant_text(payload: dict) -> str:
+    """Prefer the text Claude Code hands us in the payload. Scanning transcript_path is a race:
+    Stop can fire before the assistant entry is flushed to the JSONL, and then the scan finds no
+    readable assistant entry while last_assistant_message already carries the right text.
+    The file scan is kept only as a fallback for a payload that lacks the field."""
+    text = payload.get("last_assistant_message")
+    if isinstance(text, str) and text.strip():
+        return text
+    tp = payload.get("transcript_path")
+    return _scan_transcript(os.path.expanduser(tp)) if tp else ""
+
+
+def strip_for_speech(md: str) -> str:
+    md = re.sub(r"</?speak>", " ", md, flags=re.I)         # never read the tag name aloud
+    md = re.sub(r"```.*?```", " ", md, flags=re.S)        # fenced code
+    md = re.sub(r"`[^`]*`", " ", md)                       # inline code
+    md = re.sub(r"^\s*\|.*$", " ", md, flags=re.M)         # table rows
+    md = re.sub(r"^\s*[-*+]\s+", "", md, flags=re.M)       # bullets
+    md = re.sub(r"^#{1,6}\s*", "", md, flags=re.M)         # headings
+    md = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", md)       # links -> label
+    md = re.sub(r"[~/][\w./-]{6,}", " ", md)               # file paths
+    md = re.sub(r"[*_>]", "", md)
+    return re.sub(r"\s+", " ", md).strip()
+
+
+def pick(md: str) -> str:
+    """Prefer the <speak> block. Log BOTH outcomes: logging only fallbacks would make an
+    empty log ambiguous between 'every turn succeeded' and 'the hook never ran'."""
+    # LAST match, not the first. The contract puts the real block at the end of the reply, and
+    # replies about this harness routinely quote an example block earlier in the prose. re.search
+    # would speak the example and never reach the real one.
+    ms = list(re.finditer(r"<speak>(.*?)</speak>", md, re.S | re.I))
+    m = ms[-1] if ms else None
+    if m:
+        text = cap_at_sentence(keep_known_tags(re.sub(r"\s+", " ", m.group(1)).strip()))
+        if text:
+            note(f"SPOKE: {text[:80]!r}")
+            return text
+        # A present-but-empty tag is its own outcome, not a forgotten tag. Falling through to
+        # the fallback would speak the mangled tag AND log "no <speak> tag", which is false and
+        # would corrupt the SPOKE/FALLBACK-USED counts in speak.log.
+        note("EMPTY-TAG: <speak> block present but empty; nothing spoken")
+        return ""
+    plain = strip_for_speech(md)
+    if not plain:
+        note("FALLBACK-EMPTY: no <speak> tag and nothing speakable after stripping")
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", plain)[0]
+    note(f"FALLBACK-USED: no <speak> tag; spoke first sentence: {first[:80]!r}")
+    return cap_at_sentence(keep_known_tags(first))
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except (ValueError, OSError):
+        return
+    text = pick(last_assistant_text(payload))
+    if not text:
+        return
+    # Log the DELIVERY outcome separately from the extraction outcome pick() already logged.
+    # SPOKE: means "a block was extracted"; TTS-OK means "the speech server accepted it". Without this
+    # split, a dead or warming server would log SPOKE lines while the listener heard nothing.
+    try:
+        if speechsock is None:
+            raise RuntimeError("lib/speechsock.py did not import")
+        status, _ = speechsock.request("POST", "/speak", body=json.dumps({"text": text}).encode(),
+                                       headers={"Content-Type": "application/json"}, timeout=3)
+        note(f"TTS-OK: {status}" if 200 <= status < 300 else f"TTS-FAIL: HTTP {status}")
+    except Exception as e:                                  # noqa: BLE001 - never fatal
+        note(f"TTS-FAIL: {e.__class__.__name__}: {str(e)[:60]}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:                                  # noqa: BLE001
+        note(f"unhandled: {e.__class__.__name__}: {e}")
+    sys.exit(0)                                             # ALWAYS 0: must never block Stop

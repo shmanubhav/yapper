@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+UserPromptSubmit hook: assert voice mode, and clear the audio path for the new turn.
+
+Registered only in voice-settings.json, which only bin/yapper loads. A session that did
+not launch through yapper never runs this, which is why nothing here checks whether
+voice mode is on. Its presence IS the signal.
+
+Why this exists at all: asking the model to infer from message shape whether a turn was
+dictated, and to emit <speak> only then, is unreliable in both directions: transcription
+output is fully punctuated, and typed messages routinely look dictated. Printing the instruction every turn removes the inference. Claude Code injects
+stdout from this hook into the model's context for the same turn.
+
+This runs on the BLOCKING prompt path: Claude Code caps this event at 30 seconds and we
+register it at 10. Every network call is bounded at 1 second and every failure is swallowed.
+A dead or hung speech server must never make typing feel slow.
+"""
+import json
+import os
+import sys
+
+# The engine's socket helper lives in lib/. A broken checkout must not break a turn, so a failed
+# import only means no speech.
+sys.dont_write_bytecode = True     # never write __pycache__ into the clone
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+try:
+    import speechsock
+except Exception:                                           # noqa: BLE001
+    speechsock = None
+
+# Keep in sync with bin/speak-hook ALLOWED_TAGS (tests/test_brief.py checks).
+ALLOWED_TAGS = ("sigh", "chuckle", "laugh", "sarcastic", "gasp", "surprised", "groan", "clear throat",
+                "whispering", "happy", "angry", "fear", "crying", "dramatic")
+TAG_LIST = " ".join(f"[{t}]" for t in ALLOWED_TAGS)
+
+BRIEF = f"""VOICE MODE is active for this session: your reply will be read aloud by a local text-to-speech engine.
+
+End your reply with exactly one <speak>...</speak> block, with nothing after it.
+
+Inside the block: two to four sentences written for the ear. Answer first, then the single most important thing on screen (a number, a name, a deadline), then any question back. Enough that listening alone is useful without reading.
+
+The voice can sound expressive: add emotion tags inside <speak>, placed right before the words they colour. Allowed tags: {TAG_LIST}. Use one to three per block wherever they fit what you are saying. Never use any other bracketed tag.
+
+Never put code, file paths, tables, URLs, or identifiers inside <speak>. Say "six pull requests are mergeable", not the URLs.
+
+Everything else stays on screen only. The tag is visible on screen; that is expected."""
+
+
+def stop_playback():
+    """Cut speech still playing from the previous turn. Bounded and silent, always."""
+    try:
+        speechsock.request("POST", "/stop", body=b"", timeout=1)
+    except Exception:                       # noqa: BLE001 - never fatal, never slow
+        pass
+
+
+def main():
+    try:
+        json.load(sys.stdin)                # drain the payload; its contents are unused
+    except (ValueError, OSError):
+        pass                                # a malformed payload must not suppress the brief
+    stop_playback()
+    print(BRIEF)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:                       # noqa: BLE001
+        try:
+            print(BRIEF)                    # the instruction matters more than the /stop call
+        except Exception:                   # noqa: BLE001
+            pass
+    # Flush explicitly, and swallow a reader that has already gone away. Claude Code can close
+    # the stdout pipe early (on its own timeout, or once it has what it needs). The
+    # interpreter's shutdown flush would then raise BrokenPipeError AFTER sys.exit(0) had run,
+    # which no except block in this file can catch: measured exit 120 with 85 bytes on stderr.
+    try:
+        sys.stdout.flush()
+    except Exception:                       # noqa: BLE001
+        pass
+    os._exit(0)                             # ALWAYS 0: skips the teardown flush that can raise

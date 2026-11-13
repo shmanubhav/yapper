@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The one pinned Python for speech: yapper's own environment, built from requirements.lock by
+# `yapper --install`. Never runs uv, so a uv upgrade or cache clean cannot break a start.
+R="$(dirname "$(dirname "$(realpath "$0")")")"
+V="${YAPPER_ENV:-$HOME/.local/share/yapper}/venv"
+# transformers warns about the model type on every load; harmless, and alarming to a new user.
+export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
+# no download/progress bars ("Fetching 8 files", "Generating speech tokens"); set either to 0 to see them
+export HF_HUB_DISABLE_PROGRESS_BARS="${HF_HUB_DISABLE_PROGRESS_BARS:-1}" TQDM_DISABLE="${TQDM_DISABLE:-1}"
+cmp -s "$R/requirements.lock" "$V/requirements.lock" && exec "$V/bin/python" "$@"
+echo "yapper: speech environment missing or out of date: run yapper --install once, online" >&2
+exit 3

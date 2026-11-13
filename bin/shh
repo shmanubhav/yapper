@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Silence speech in progress, so the microphone can open without recording the speech output.
+#
+# lib/micwatch.py stops speech automatically when a mic opens; this is the manual equivalent.
+#
+# Fails silently by design: it is typed mid-thought, frequently when nothing is playing or
+# the server is not running, and noise in that moment is worse than doing nothing.
+R="$(dirname "$(dirname "$(realpath "$0")")")"
+S="${YAPPER_SOCKET:-$HOME/.cache/yapper/speech.sock}"
+. "$R/lib/sockcheck.sh" 2>/dev/null || exit 0
+[ -z "$(sock_problem "$S")" ] || exit 0          # never talk to a socket in a folder others can reach
+curl -sS -m 1 --unix-socket "$S" -X POST "http://localhost/stop" >/dev/null 2>&1
+exit 0

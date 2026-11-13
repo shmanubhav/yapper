@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# yapper: start Claude Code with spoken replies.
+#
+# Health-gates the speech engine BEFORE exec, so Claude Code never launches in voice mode
+# with nothing able to speak.
+#
+# yapper owns speech output only. Dictation is optional: OpenSuperWhisper, a separate app
+# driven by its own global hotkey, types into whichever window has focus; this script starts
+# it when it is installed and carries on without it when it is not. Everything voice-specific
+# lives in voice-settings.json, so a plain `claude` session loads none of it.
+set -uo pipefail
+umask 077    # the cache dir, logs and pidfiles are this user's only
+R="$(dirname "$(dirname "$(realpath "$0")")")"
+C="$HOME/.cache/yapper"; mkdir -p "$C"
+PY=3.12.15   # the speech environment's Python, the same on every Mac
+UV_MIN=0.12.22   # the first uv that can download Python 3.12.15 (and has every flag --install uses)
+OSW="OpenSuperWhisper"
+SETTINGS="$R/voice-settings.json"
+CONFIG="${YAPPER_CONFIG:-$HOME/.config/yapper/config}"
+# The engine listens on a Unix socket in a folder only this account can enter, never a network
+# port. A second install on the same Mac uses its own YAPPER_SOCKET.
+SOCK="${YAPPER_SOCKET:-$C/speech.sock}"
+# The hooks in voice-settings.json find their scripts through YAPPER_ROOT and the engine through
+# YAPPER_SOCKET; both reach them because claude is a child of this script.
+export YAPPER_ROOT="$R" YAPPER_SOCKET="$SOCK"
+# Processes are found through pidfiles written at start, never by searching for a pattern. A pid
+# is only trusted while its command line still ends in this checkout's script path (pid reuse).
+SPEAKER_PID="$SOCK.speaker.pid"
+MICWATCH_PID="$SOCK.micwatch.pid"
+SPEAKER_PAT="$R/lib/speaker.py"
+MICWATCH_PAT="$R/lib/micwatch.py"
+. "$R/lib/sockcheck.sh"
+
+osw_up(){ pgrep -x "$OSW" >/dev/null 2>&1; }   # macOS pgrep has no -q
+sock_check(){   # the socket's folder must exist, be ours, and be closed to everyone else
+  local why
+  case "$SOCK" in /*) mkdir -p "$(dirname "$SOCK")" 2>/dev/null ;; esac   # new folders are 700 (umask)
+  why="$(sock_problem "$SOCK")"
+  [ -z "$why" ] || die "$why"
+}
+alive(){ curl -s -o /dev/null -m 2 --unix-socket "$SOCK" "http://localhost/health" 2>/dev/null; }
+# /health answers {"ok": ..., "status": ..., "root": "<checkout>"}; only this checkout's engine counts.
+probe(){
+  local out
+  out="$(curl -s -m 2 --unix-socket "$SOCK" -w '\n%{http_code}' "http://localhost/health" 2>/dev/null)"
+  CODE="${out##*$'\n'}"; BODY="${out%$'\n'*}"
+  [ "$BODY" = "$out" ] && BODY=""
+  [ -n "$CODE" ] || CODE=000
+}
+engine_root(){
+  local x
+  case "$BODY" in *'"root": "'*) x="${BODY#*\"root\": \"}"; printf '%s' "${x%%\"*}" ;; *) printf 'unknown' ;; esac
+}
+ours(){ [ "$(engine_root)" = "$R" ]; }
+foreign_check(){
+  case "$CODE" in 200|500|503)
+    ours || die "$SOCK is held by another engine (root $(engine_root)); stop it or set YAPPER_SOCKET" ;;
+  esac
+}
+healthy(){ probe; [ "$CODE" = 200 ] && ours; }
+pid_of(){   # prints the pid in pidfile $1 while that process still runs script $2
+  local p cmd
+  [ -f "$1" ] || return 1
+  p="$(cat "$1" 2>/dev/null)"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  cmd="$(ps -p "$p" -o command= 2>/dev/null)" || return 1
+  case "$cmd" in *" $2"|*" $2 "*) printf '%s' "$p" ;; *) return 1 ;; esac
+}
+stop_pidfile(){   # no pidfile, or a pid that is not ours: nothing is killed
+  local p raw
+  if p="$(pid_of "$1" "$2")"; then
+    kill "$p" 2>/dev/null
+    rm -f "$1"
+    return 0
+  fi
+  # Not ours. Keep the file while its pid is alive (another clone's engine may own it); clear it
+  # only when it is stale.
+  raw="$(cat "$1" 2>/dev/null)"
+  case "$raw" in ''|*[!0-9]*) rm -f "$1" ;; *) kill -0 "$raw" 2>/dev/null || rm -f "$1" ;; esac
+}
+die(){ printf "\033[31myapper: %s\033[0m\n" "$1" >&2; exit 1; }
+warn(){ printf "\033[33myapper: %s\033[0m\n" "$1" >&2; }
+say(){ printf "  %-26s %s\n" "$1" "$2"; }
+
+# Config: plain KEY=value lines, read as data. Never sourced or evaluated, so nothing in the
+# file can run. Keys: voice (a .wav path, or the name of a file in voices/) and speed (a number).
+# Unknown keys and comments are ignored; a bad value stops with the line number. A value the
+# user already set in the environment wins over the file.
+CFG_LINE='^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$'
+CFG_SPEED='^(0\.[5-9][0-9]*|1(\.[0-9]+)?|2(\.0+)?)$'
+CFG_VOICE='^[A-Za-z0-9._/~ +-]+$'
+resolve_voice(){   # prints the clip path for a config voice value, or nothing
+  local v="$1"
+  case "$v" in
+    "~/"*) v="$HOME/${v#\~/}" ;;
+    */*) ;;
+    *) case "$v" in *.wav) ;; *) v="$v.wav" ;; esac; v="$R/voices/$v" ;;
+  esac
+  case "$v" in *.wav) [ -f "$v" ] && printf '%s' "$v" ;; esac
+  return 0
+}
+load_config(){
+  [ -f "$CONFIG" ] || return 0
+  local n=0 line key val cfg_voice="" cfg_speed="" path
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"     # trim leading space
+    line="${line%"${line##*[![:space:]]}"}"     # trim trailing space
+    case "$line" in ''|'#'*) continue ;; esac
+    [[ "$line" =~ $CFG_LINE ]] || die "$CONFIG line $n: expected KEY=value"
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+    case "$key" in
+      voice)
+        [[ "$val" =~ $CFG_VOICE ]] || die "$CONFIG line $n: voice must be a .wav path or a name in voices/ (letters, digits, space and . _ - + / ~ only)"
+        path="$(resolve_voice "$val")"
+        [ -n "$path" ] || die "$CONFIG line $n: voice '$val' is not a .wav file (bare names are looked up in $R/voices)"
+        cfg_voice="$path" ;;
+      speed)
+        [[ "$val" =~ $CFG_SPEED ]] || die "$CONFIG line $n: speed must be a number from 0.5 to 2.0, like 1.07"
+        cfg_speed="$val" ;;
+      *) ;;   # unknown key: ignored
+    esac
+  done < "$CONFIG"
+  if [ -n "$cfg_voice" ] && [ -z "${YAPPER_TTS_VOICE_WAV+x}" ]; then export YAPPER_TTS_VOICE_WAV="$cfg_voice"; fi
+  if [ -n "$cfg_speed" ] && [ -z "${YAPPER_TTS_SPEED+x}" ]; then export YAPPER_TTS_SPEED="$cfg_speed"; fi
+  return 0
+}
+
+# claude keeps only the LAST --settings flag. A caller-supplied one would silently replace
+# voice-settings.json: both hooks gone, and native dictation re-enabled by the user-scope
+# default, so audio from the dictation key would no longer stay on this machine.
+case " $* " in
+  *" --settings "*|*" --settings="*) die "pass extra settings through voice-settings.json, not --settings" ;;
+esac
+
+[ -f "$SETTINGS" ] || die "missing $SETTINGS"
+
+if [ "${1-}" = "--config" ]; then
+  load_config
+  if [ -f "$CONFIG" ]; then say "config file" "$CONFIG"; else say "config file" "$CONFIG (none)"; fi
+  say "voice" "${YAPPER_TTS_VOICE_WAV:-$R/voices/derry_b.wav}"
+  say "speed" "${YAPPER_TTS_SPEED:-1.07}"
+  exit 0
+fi
+
+say "voice settings" "$SETTINGS"
+
+# --install puts `yapper` on the PATH as ~/.local/bin/yapper -> this checkout. It never replaces
+# something else already there and never edits a shell startup file; it prints the line instead.
+link_command(){
+  local bin="$HOME/.local/bin" link="$HOME/.local/bin/yapper" target="$R/bin/yapper" rc
+  mkdir -p "$bin" || { warn "could not create $bin; put $target on your PATH yourself"; return 0; }
+  if [ -L "$link" ] && [ "$(realpath "$link" 2>/dev/null)" = "$target" ]; then
+    say "command" "$link already points at this checkout"
+  elif [ -L "$link" ] || [ -e "$link" ]; then
+    if [ -L "$link" ]; then warn "$link points at $(readlink "$link"), not this checkout; left as is"
+    else warn "$link is a regular file, not a link to this checkout; left as is"
+    fi
+    echo "  to replace it: ln -sfn \"$target\" \"$link\""
+  elif ln -s "$target" "$link"; then
+    say "command" "linked $link -> $target"
+  else
+    warn "could not link $link; put $target on your PATH yourself"
+  fi
+  case ":$PATH:" in *":$bin:"*|*":$bin/:"*) return 0 ;; esac
+  case "${SHELL##*/}" in zsh) rc="~/.zshrc" ;; bash) rc="~/.bash_profile" ;; *) rc="" ;; esac
+  echo "yapper: ~/.local/bin is not on your PATH. add it with this one line:"
+  if [ -n "$rc" ]; then
+    printf "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> %s\n" "$rc"
+  else
+    printf "  export PATH=\"\$HOME/.local/bin:\$PATH\"   (add this to your shell's startup file)\n"
+  fi
+  echo "  then open a new terminal."
+}
+
+if [ "${1-}" = "--install" ]; then
+  E="${YAPPER_ENV:-$HOME/.local/share/yapper}"; V="$E/venv"
+  NET="download failed (behind a proxy? try UV_SYSTEM_CERTS=1, HTTPS_PROXY or UV_PYTHON_INSTALL_MIRROR; an old uv? brew upgrade uv); see the output above"
+  link_command    # first: cheap, and it fails before the slow download would
+  command -v uv >/dev/null || die "--install needs uv: brew install uv"
+  uv_have="$(uv --version 2>/dev/null | awk '{print $2}')"
+  [ "$(printf '%s\n%s\n' "$UV_MIN" "$uv_have" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "$UV_MIN" ] \
+    || die "--install needs uv $UV_MIN or newer; you have ${uv_have:-an unknown version}. update it: brew upgrade uv"
+  # Never change the environment under a running server; until it is stamped again, voice refuses to start.
+  stop_pidfile "$SPEAKER_PID" "$SPEAKER_PAT"
+  rm -f "$V/requirements.lock"
+  echo "yapper: building the speech environment in $E (needs network)"
+  uv python install "$PY" --no-bin --install-dir "$E/python" || die "$NET"
+  if [ "$("$V/bin/python" -c 'import platform; print(platform.python_version())' 2>/dev/null)" != "$PY" ]; then
+    UV_PYTHON_INSTALL_DIR="$E/python" uv venv -q --clear --managed-python --no-python-downloads --python "$PY" "$V" \
+      || die "could not create $V; if uv says it is not a virtual environment, move it aside and run --install again"
+  fi
+  # clone copies the files, so cleaning uv's cache never reaches the environment
+  uv pip sync -q --python "$V/bin/python" --require-hashes --link-mode clone "$R/requirements.lock" || die "$NET"
+  uv pip check --python "$V/bin/python" || die "the speech environment does not match requirements.lock; see the output above"
+  cp "$R/requirements.lock" "$V/requirements.lock" || die "could not stamp $V"
+  echo "yapper: fetching the pinned voice model once (needs network)"
+  HF_HUB_OFFLINE=0 "$R/bin/tts-python" "$R/lib/speaker.py" --install || die "install failed; see the output above"
+  echo "yapper: installed. next: yapper --setup"; exit 0
+fi
+
+if [ "${1-}" = "--stop" ]; then
+  stop_pidfile "$SPEAKER_PID" "$SPEAKER_PAT"
+  stop_pidfile "$MICWATCH_PID" "$MICWATCH_PAT"
+  # wait for the engine to go, so `--stop && --check` starts a fresh server instead of finding the old one
+  if [ -z "$(sock_problem "$SOCK")" ]; then
+    end=$((SECONDS + 5))
+    while alive && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+    alive && die "a speech engine still answers on $SOCK after 5s; run yapper --stop again"
+  fi
+  echo "yapper: speech engine and mic watcher stopped (OpenSuperWhisper left running)"; exit 0
+fi
+
+if [ "${1-}" = "--status" ]; then
+  why="$(sock_problem "$SOCK")"
+  if [ -n "$why" ]; then say "speech" "refused: $why"
+  else
+    probe
+    if [ "$CODE" = 200 ] && ours; then say "speech" "ready on $SOCK"
+    elif [ "$CODE" = 503 ] && ours; then say "speech" "starting (loading the model)"
+    elif [ "$CODE" = 500 ] && ours; then say "speech" "failed to load; see $C/tts.log"
+    elif [ "$CODE" != 000 ] && ! ours; then say "speech" "$SOCK held by another engine (root $(engine_root))"
+    else say "speech" "DOWN"
+    fi
+  fi
+  if osw_up; then say "dictation" "$OSW running"
+  else say "dictation" "$OSW not running (optional; speech output works without it)"
+  fi
+  pid_of "$MICWATCH_PID" "$MICWATCH_PAT" >/dev/null && say "mic watcher" "running" || say "mic watcher" "NOT RUNNING"
+  exit 0
+fi
+
+# One short-lived process plays samples, never a second engine: two copies of the model need
+# about 9 GB. So a running engine of ours is stopped first (restart=1) and started again after.
+pause_engine(){   # $1: the command, for messages
+  restart=""
+  if alive; then
+    probe; ours || die "another engine answers on $SOCK (root $(engine_root)); stop it or set YAPPER_SOCKET"
+    echo "yapper: pausing the speech engine while the samples play"
+    stop_pidfile "$SPEAKER_PID" "$SPEAKER_PAT"
+    end=$((SECONDS + 5))
+    while alive && [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+    alive && die "the speech engine did not stop within 5s; run yapper --stop, then yapper $1"
+    restart=1
+  fi
+}
+
+if [ "${1-}" = "--setup" ]; then
+  # Interactive only: a Claude-driven install uses --sample and the config file (INSTALL.md).
+  if [ ! -t 0 ]; then
+    echo "yapper --setup is an interactive wizard for your own terminal: it plays the voices and" >&2
+    echo "speeds for you to pick, writes $CONFIG, walks through the OpenSuperWhisper permissions" >&2
+    echo "and hotkey, then starts the engine and speaks a test phrase." >&2
+    echo "Without a terminal, use yapper --sample and edit the config file (see INSTALL.md)." >&2
+    exit 2
+  fi
+  sock_check
+  pause_engine --setup
+  # Runs before load_config on purpose: the new file, not the old one, must reach --check.
+  HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" "$R/bin/tts-python" "$R/lib/wizard.py"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ -n "$restart" ] && { echo "yapper: starting the speech engine again"; "$R/bin/yapper" --check; }
+    exit "$rc"
+  fi
+  echo; echo "yapper: starting the engine in your new voice"
+  "$R/bin/yapper" --check || exit 1
+  echo; echo "start with: yapper"
+  echo "To change voice or speed later, run yapper --setup again."
+  exit 0
+fi
+
+load_config
+sock_check
+
+if [ "${1-}" = "--sample" ]; then
+  pause_engine --sample
+  shift
+  HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" "$R/bin/tts-python" "$R/lib/sample.py" "$@"; rc=$?
+  if [ -n "$restart" ]; then
+    echo "yapper: starting the speech engine again"
+    "$R/bin/yapper" --check || rc=1
+  fi
+  exit "$rc"
+fi
+
+echo "yapper: starting engines"
+
+# Speech output: Chatterbox loads in ~33s cold, ~3s warm. A dot every 5s so a slow start does not read as hung.
+# Log is appended, never truncated, so a failed start keeps the previous run's log.
+if ! alive; then
+  "$R/bin/tts-python" -c '' 2>/dev/null || die "speech environment missing or out of date: run yapper --install once, online"
+  off=0; [ -f "$C/tts.log" ] && off=$(wc -c < "$C/tts.log")
+  nohup "$R/bin/tts-server" >>"$C/tts.log" 2>&1 & pid=$!; disown
+  # the server writes $SPEAKER_PID itself once it owns the socket, so a losing racer never does
+elif ! "$R/bin/tts-python" -c '' 2>/dev/null; then
+  say "speech environment" "out of date: run yapper --install when convenient"
+fi
+printf "  %-26s " "speech"
+for i in $(seq 1 90); do
+  probe
+  foreign_check
+  [ "$CODE" = "200" ] && break
+  # stop the failed server so the next start (after --install) loads fresh
+  [ "$CODE" = "500" ] && { stop_pidfile "$SPEAKER_PID" "$SPEAKER_PAT"; die "speech engine failed to load. if this is a new machine run: yapper --install. see $C/tts.log"; }
+  # the server we started died and no other answers on the socket: show this run's log lines instead of waiting out the 90s
+  if [ -n "${pid-}" ] && ! kill -0 "$pid" 2>/dev/null && ! alive; then
+    echo; tail -c "+$((off + 1))" "$C/tts.log" | tail -n 5 >&2
+    die "speech engine exited while starting. see $C/tts.log"
+  fi
+  [ $((i % 5)) -eq 0 ] && printf "."
+  sleep 1
+done
+healthy || die "speech engine failed to warm up in 90s. see $C/tts.log"
+echo "ready"
+
+# Mic watcher: stops speech when any microphone starts recording.
+if ! pid_of "$MICWATCH_PID" "$MICWATCH_PAT" >/dev/null; then
+  # micwatch claims $MICWATCH_PID itself (exclusively), so two launchers never run two watchers
+  nohup python3 "$R/lib/micwatch.py" >>"$C/micwatch.log" 2>&1 & disown
+  sleep 0.5    # long enough for a broken start to exit
+fi
+if pid_of "$MICWATCH_PID" "$MICWATCH_PAT" >/dev/null; then
+  say "mic watcher" "running"
+else
+  warn "mic watcher did not start (see $C/micwatch.log); speech will not stop by itself when you dictate"
+  say "mic watcher" "NOT RUNNING"
+fi
+
+# Dictation is optional. -g launches without stealing focus from this terminal.
+if ! osw_up && open -g -a "$OSW" 2>/dev/null; then
+  for i in $(seq 1 20); do osw_up && break; sleep 1; done
+fi
+if osw_up; then
+  say "dictation" "$OSW ready"
+  HINT="press your OpenSuperWhisper hotkey to talk."
+else
+  warn "$OSW is missing or did not start (blocked by Gatekeeper?); continuing without dictation, speech output still works. to add it: brew install --cask opensuperwhisper"
+  say "dictation" "off (optional)"
+  HINT="type as usual; replies are spoken."
+fi
+
+if [ "${1-}" = "--check" ]; then
+  code="$(curl -sS -m 10 --unix-socket "$SOCK" -o /dev/null -w '%{http_code}' -X POST "http://localhost/speak" \
+       -H 'Content-Type: application/json' -d '{"text":"Yapper is ready."}')"
+  [ "$code" = 202 ] || die "speech round-trip failed (HTTP ${code:-none} from /speak)"
+  say "round-trip" "spoke a test phrase"
+  echo "  all engines healthy."
+  exit 0
+fi
+
+echo "  audio stays on this machine. $HINT"
+echo "  speech stops when you start dictating or send your next prompt. to cut it now: ! \"$R/bin/shh\""
+echo
+exec claude --settings "$SETTINGS" "$@"

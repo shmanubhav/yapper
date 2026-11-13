@@ -1,0 +1,10 @@
+# yapper config: copy to ~/.config/yapper/config (or point YAPPER_CONFIG at another file).
+# Plain KEY=value lines. The file is read as data, never run. Lines starting with # are ignored.
+# YAPPER_TTS_VOICE_WAV and YAPPER_TTS_SPEED in your environment win over this file.
+# Restart the engine after a change: yapper --stop, then yapper.
+
+# voice: a name of a clip in voices/ (with or without .wav), or a path to your own .wav
+voice=derry_b
+
+# speed: playback rate from 0.5 to 2.0 (pitch is kept); 1.07 is the default
+speed=1.07
