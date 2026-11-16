@@ -27,7 +27,7 @@ matters, so stop before installing or upgrading anything.
 | Disk | `df -h ~` | at least 3 GB free (environment plus model) |
 | Homebrew | `command -v brew` | a path |
 | uv 0.12.22 or newer | `uv --version` | version at least 0.12.22; if missing: `brew install uv`, if older: `brew upgrade uv` (ask first either way) |
-| Claude Code | `type claude` | a path, alias or shell function (all three work) |
+| Claude Code | `bash -c 'command -v claude'` | a path (yapper starts Claude from a script, which sees no aliases or shell functions); if empty, show `type claude` and offer to link the real binary into `~/.local/bin` (ask first) |
 | python3 (the hooks run on it) | `command -v python3` | a path; if missing: `xcode-select --install` (HUMAN-ONLY dialog) |
 | Hooks allowed | see below | neither key set to true |
 
@@ -61,8 +61,9 @@ this Mac until whoever manages it allows user hooks. Do not try to work around t
 `yapper --setup` is an interactive wizard that covers steps 3 to 6 below: it plays the voices
 and speeds for the user to pick, writes the config, walks through OpenSuperWhisper's
 permissions and hotkey, then starts the engine and speaks a test phrase. It reads from a real
-terminal, so neither your Bash tool nor a `!` line can run it (it exits 2 without one). Offer it
-first: ask the user to open a separate terminal window and run `yapper --setup` there, wait for
+terminal, so neither your Bash tool nor a `!` line can run it (it exits 2 without one). It
+stops with the same "another engine answers" error as `--sample`; see step 4 for that case.
+Offer it first: ask the user to open a separate terminal window and run `yapper --setup` there, wait for
 them to say done, then go to step 7. If they would rather you lead, follow steps 3 to 6 with
 `--sample` and the config file.
 
@@ -85,9 +86,9 @@ step 4: yapper works without dictation.
 ## 4. Pick a voice
 
 1. No need to stop this checkout's engine: `yapper --sample` pauses it and starts it again
-   afterwards. If it stops with "another engine answers on ... (root OTHER)", an older clone's
+   afterwards. If it stops with "another engine answers on ... (root OTHER)", another clone's
    engine holds the socket: tell the user, and on their OK run `OTHER/bin/yapper --stop`, then
-   run `yapper --sample` again.
+   run `yapper --sample` again. If OTHER is `unknown`, tell the user and stop; do not guess.
 2. List the clips: `ls REPO/voices/*.wav`. If the user has their own clip, see
    `voices/README.md` for what makes a good one (5 to 15 seconds, clean, mono WAV) and remind
    them to use only a voice they have the speaker's consent to clone.
