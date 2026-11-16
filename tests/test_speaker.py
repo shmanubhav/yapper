@@ -231,4 +231,37 @@ sp.release(srv, SOCK)
 check(not os.path.exists(SOCK), "a clean shutdown removes the socket")
 os.rmdir(SOCK_DIR)
 
+# --- the speech tokenizer is fetched at its pinned revision and refused on a wrong hash
+import hashlib
+import speaker as spk
+calls = []
+
+
+def fake_download(body):
+    def dl(**kw):
+        calls.append(kw)
+        fd, p = tempfile.mkstemp(suffix=".safetensors")
+        os.write(fd, body)
+        os.close(fd)
+        return p
+    return dl
+
+
+real = spk.S3TOK_SHA256
+spk.S3TOK_SHA256 = hashlib.sha256(b"weights").hexdigest()
+try:
+    p = spk.pinned_tokenizer_path(fake_download(b"weights"))
+    check(calls[-1] == {"repo_id": spk.S3TOK_REPO, "filename": spk.S3TOK_FILE, "revision": spk.S3TOK_REVISION},
+          f"tokenizer fetched at the pinned revision {calls[-1]}")
+    check(open(p, "rb").read() == b"weights", "the matching file is returned")
+    os.unlink(p)
+    try:
+        spk.pinned_tokenizer_path(fake_download(b"tampered"))
+        check(False, "a wrong sha256 raises")
+    except RuntimeError as e:
+        check("expected" in str(e), "a wrong sha256 raises")
+finally:
+    spk.S3TOK_SHA256 = real
+check(len(spk.S3TOK_REVISION) == 40 and len(spk.S3TOK_SHA256) == 64, "revision and hash are full-length pins")
+
 sys.exit(0 if ok else 1)
