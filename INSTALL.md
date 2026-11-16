@@ -27,7 +27,7 @@ matters, so stop before installing or upgrading anything.
 | Disk | `df -h ~` | at least 3 GB free (environment plus model) |
 | Homebrew | `command -v brew` | a path |
 | uv 0.12.22 or newer | `uv --version` | version at least 0.12.22; if missing: `brew install uv`, if older: `brew upgrade uv` (ask first either way) |
-| Claude Code | `command -v claude` | a path |
+| Claude Code | `type claude` | a path, alias or shell function (all three work) |
 | python3 (the hooks run on it) | `command -v python3` | a path; if missing: `xcode-select --install` (HUMAN-ONLY dialog) |
 | Hooks allowed | see below | neither key set to true |
 
@@ -84,7 +84,10 @@ step 4: yapper works without dictation.
 
 ## 4. Pick a voice
 
-1. No need to stop the engine: `yapper --sample` pauses it and starts it again afterwards.
+1. No need to stop this checkout's engine: `yapper --sample` pauses it and starts it again
+   afterwards. If it stops with "another engine answers on ... (root OTHER)", an older clone's
+   engine holds the socket: tell the user, and on their OK run `OTHER/bin/yapper --stop`, then
+   run `yapper --sample` again.
 2. List the clips: `ls REPO/voices/*.wav`. If the user has their own clip, see
    `voices/README.md` for what makes a good one (5 to 15 seconds, clean, mono WAV) and remind
    them to use only a voice they have the speaker's consent to clone.
