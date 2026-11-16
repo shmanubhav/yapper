@@ -97,7 +97,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # realpath
 MODEL = os.environ.get("YAPPER_TTS_MODEL", "mlx-community/chatterbox-turbo-fp16")
 # Pinned: this TTS model revision, the speech tokenizer below, and the hashed packages in
 # requirements.lock. mlx-audio fetches the tokenizer at its latest revision on its own; load_model
-# then replaces those weights with the pinned file, checked by sha256.
+# then replaces every one of those weights with the pinned file, checked by sha256.
 REVISION = os.environ.get("YAPPER_TTS_REVISION", "b2d0a13aa7cfff0a06d9acb247ae91c8f19a6d75")
 S3TOK_REPO, S3TOK_FILE = "mlx-community/S3TokenizerV2", "model.safetensors"
 S3TOK_REVISION = "e0c9886f0e1c35ae85b1f27277416fb19fc72bec"
@@ -119,7 +119,8 @@ def pinned_tokenizer_path(download=None):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     if h.hexdigest() != S3TOK_SHA256:
-        raise RuntimeError(f"speech tokenizer {path} has sha256 {h.hexdigest()}, expected {S3TOK_SHA256}")
+        raise RuntimeError(f"speech tokenizer sha256 {h.hexdigest()[:16]} != pinned {S3TOK_SHA256[:16]}; "
+                           f"rerun yapper --install ({path})")
     return path
 
 
@@ -139,7 +140,7 @@ class ChatterboxEngine:
         weights = mx.load(pinned_tokenizer_path())
         if hasattr(tok, "sanitize"):
             weights = tok.sanitize(weights)
-        tok.load_weights(list(weights.items()), strict=False)
+        tok.load_weights(list(weights.items()), strict=True)   # every tokenizer weight from the pinned file
         mx.eval(tok.parameters())
         log.info("speech tokenizer pinned at %s@%s (sha256 checked)", S3TOK_REPO, S3TOK_REVISION[:8])
 

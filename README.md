@@ -146,8 +146,9 @@ Other optional settings: `YAPPER_SOCKET` (the engine's socket, default
 - Audio made by Chatterbox carries Resemble AI's PerTh watermark, an inaudible marker that
   identifies it as synthetic speech.
 - Supply chain: `--install` pins the TTS model to one Hugging Face revision and every Python
-  package to a hash. One file is not pinned: mlx-audio downloads the speech tokenizer
-  (`mlx-community/S3TokenizerV2`, `model.safetensors`) at whatever revision is current.
+  package to a hash. The speech tokenizer (`mlx-community/S3TokenizerV2`) is pinned to one
+  revision and checked by sha256. mlx-audio still downloads that repo's current revision during
+  `--install` (weights only, safetensors); yapper replaces it with the pinned file before use.
 - Logs and pidfiles in `~/.cache/yapper/` are readable by your user only.
 
 ## Uninstall

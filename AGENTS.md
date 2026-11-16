@@ -28,7 +28,7 @@ Launcher `bin/yapper`; hooks `bin/voice-brief` (UserPromptSubmit) and `bin/speak
 ## Standing choices
 - Voice mode exists only in sessions started by `yapper`; nothing infers it from how a message reads.
 - `voice-settings.json` keeps built-in dictation off (`voice.enabled` and `voiceEnabled` false), so audio stays on this Mac.
-- Pinned: the TTS model's Hugging Face revision (`lib/speaker.py`) and the Python packages, with hashes (`requirements.lock`). Not pinned: mlx-audio itself downloads the speech tokenizer (`mlx-community/S3TokenizerV2`, `model.safetensors`) at its latest revision during `--install`.
+- Pinned: the TTS model's Hugging Face revision (`lib/speaker.py`) and the Python packages, with hashes (`requirements.lock`). The speech tokenizer (`mlx-community/S3TokenizerV2`) is pinned by revision and sha256 in `lib/speaker.py`; mlx-audio still fetches its latest revision during `--install`, and `load_model` replaces those weights with the pinned file (`strict=True`).
 - Speech never blocks or fails a turn: it is an add-on, so the hooks swallow every failure, and `speak-hook` logs its own.
 - Dictation is optional: a missing OpenSuperWhisper is a warning, never an error.
 - The voices in `voices/` are synthetic, not real people (`voices/README.md` records where each came from).

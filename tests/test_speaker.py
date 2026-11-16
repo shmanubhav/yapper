@@ -243,6 +243,7 @@ def fake_download(body):
         fd, p = tempfile.mkstemp(suffix=".safetensors")
         os.write(fd, body)
         os.close(fd)
+        kw["_path"] = p
         return p
     return dl
 
@@ -251,7 +252,7 @@ real = spk.S3TOK_SHA256
 spk.S3TOK_SHA256 = hashlib.sha256(b"weights").hexdigest()
 try:
     p = spk.pinned_tokenizer_path(fake_download(b"weights"))
-    check(calls[-1] == {"repo_id": spk.S3TOK_REPO, "filename": spk.S3TOK_FILE, "revision": spk.S3TOK_REVISION},
+    check({k: v for k, v in calls[-1].items() if k != "_path"} == {"repo_id": spk.S3TOK_REPO, "filename": spk.S3TOK_FILE, "revision": spk.S3TOK_REVISION},
           f"tokenizer fetched at the pinned revision {calls[-1]}")
     check(open(p, "rb").read() == b"weights", "the matching file is returned")
     os.unlink(p)
@@ -259,9 +260,57 @@ try:
         spk.pinned_tokenizer_path(fake_download(b"tampered"))
         check(False, "a wrong sha256 raises")
     except RuntimeError as e:
-        check("expected" in str(e), "a wrong sha256 raises")
+        check(str(e)[:160].count(" != pinned ") == 1 and "--install" in str(e)[:160],
+              f"the refusal keeps both hashes and the fix within the 160-char status {str(e)[:160]}")
+    finally:
+        os.unlink(calls[-1]["_path"]) if "_path" in calls[-1] else None
 finally:
     spk.S3TOK_SHA256 = real
 check(len(spk.S3TOK_REVISION) == 40 and len(spk.S3TOK_SHA256) == 64, "revision and hash are full-length pins")
+
+# --- load_model swaps every tokenizer weight for the pinned file (fake mlx and mlx-audio)
+import types
+
+
+class FakeTok:
+    def __init__(self):
+        self.loaded = None
+
+    def sanitize(self, w):
+        return {"s." + k: v for k, v in w.items()}
+
+    def load_weights(self, items, strict):
+        self.loaded = (dict(items), strict)
+
+    def parameters(self):
+        return {}
+
+
+tok_obj = FakeTok()
+fake_utils = types.ModuleType("mlx_audio.tts.utils")
+fake_utils.load_model = lambda model_id, revision: types.SimpleNamespace(_s3tokenizer=tok_obj, rev=revision)
+fake_core = types.ModuleType("mlx.core")
+fake_core.load = lambda path: {"w": "from " + path}
+fake_core.eval = lambda *_: None
+fake_mlx = types.ModuleType("mlx")
+fake_mlx.core = fake_core
+saved = {k: sys.modules.get(k) for k in ("mlx", "mlx.core", "mlx_audio", "mlx_audio.tts", "mlx_audio.tts.utils")}
+sys.modules.update({"mlx": fake_mlx, "mlx.core": fake_core, "mlx_audio": types.ModuleType("mlx_audio"),
+                    "mlx_audio.tts": types.ModuleType("mlx_audio.tts"), "mlx_audio.tts.utils": fake_utils})
+real_pin = spk.pinned_tokenizer_path
+spk.pinned_tokenizer_path = lambda: "/pinned/model.safetensors"
+try:
+    eng = spk.ChatterboxEngine(voice_wav="/x.wav")
+    eng.load_model()
+    check(tok_obj.loaded == ({"s.w": "from /pinned/model.safetensors"}, True),
+          f"load_model loads the pinned, sanitized weights with strict=True {tok_obj.loaded}")
+    check(eng.model.rev == spk.REVISION, "the TTS model itself still loads at its pinned revision")
+finally:
+    spk.pinned_tokenizer_path = real_pin
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
 
 sys.exit(0 if ok else 1)
