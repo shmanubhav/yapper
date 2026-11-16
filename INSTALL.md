@@ -61,11 +61,11 @@ this Mac until whoever manages it allows user hooks. Do not try to work around t
 `yapper --setup` is an interactive wizard that covers steps 3 to 6 below: it plays the voices
 and speeds for the user to pick, writes the config, walks through OpenSuperWhisper's
 permissions and hotkey, then starts the engine and speaks a test phrase. It reads from a real
-terminal, so neither your Bash tool nor a `!` line can run it (it exits 2 without one). It
-stops with the same "another engine answers" error as `--sample`; see step 4 for that case.
-Offer it first: ask the user to open a separate terminal window and run `yapper --setup` there, wait for
-them to say done, then go to step 7. If they would rather you lead, follow steps 3 to 6 with
-`--sample` and the config file.
+terminal, so neither your Bash tool nor a `!` line can run it (it exits 2 without one). If
+another clone's engine holds the socket, it stops with the same "another engine answers" error
+as `--sample`; step 4 covers that case. Offer it first: ask the user to open a separate
+terminal window and run `yapper --setup` there, wait for them to say done, then go to step 7.
+If they would rather you lead, follow steps 3 to 6 with `--sample` and the config file.
 
 ## 3. Dictation (optional)
 
