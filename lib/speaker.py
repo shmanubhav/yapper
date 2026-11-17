@@ -130,13 +130,13 @@ def pinned_tokenizer_path(download=None):
     if got != S3TOK_SHA256:
         log.warning("speech tokenizer %s has sha256 %s; fetching it again", path, got[:16])
         try:
-            path = download(force_download=True, **kw)
-            got = _sha256(path)
+            fresh = download(force_download=True, **kw)
+            path, got = fresh, _sha256(fresh)
         except Exception as e:          # noqa: BLE001  offline (the engine) or no network
             log.warning("could not fetch the speech tokenizer again: %s", e)
     if got != S3TOK_SHA256:
         raise RuntimeError(f"speech tokenizer sha256 {got[:16]} != pinned {S3TOK_SHA256[:16]}; "
-                           f"delete it, then rerun yapper --install ({path})")
+                           f"rerun yapper --install online ({path})")
     return path
 
 

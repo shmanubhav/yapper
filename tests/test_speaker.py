@@ -275,7 +275,7 @@ try:
             check(False, f"{label}: raises")
         except RuntimeError as e:
             s = str(e)[:160]
-            check(s.count(" != pinned ") == 1 and "delete it, then rerun yapper --install" in s,
+            check(s.count(" != pinned ") == 1 and "rerun yapper --install online" in s,
                   f"{label}: refusal keeps both hashes and the fix within the 160-char status {s}")
         check(len(calls) == 2, f"{label}: exactly one re-fetch {calls}")
 finally:
