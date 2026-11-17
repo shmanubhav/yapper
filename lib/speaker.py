@@ -8,7 +8,7 @@ The reference clip voices/derry_b.wav is a synthetic voice designed with Qwen3-T
 Served over a Unix socket in a private folder (lib/speechsock.py), never a network port.
 Clips play on this Mac through afplay.
 """
-import json, logging, os, queue, signal, stat, subprocess, sys, tempfile, threading
+import hashlib, json, logging, os, queue, signal, stat, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler
 
 import speechsock
@@ -95,15 +95,33 @@ class Speaker:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))   # realpath, as bin/yapper
 MODEL = os.environ.get("YAPPER_TTS_MODEL", "mlx-community/chatterbox-turbo-fp16")
-# Pinned: this TTS model revision, plus the hashed packages in requirements.lock. Not pinned:
-# mlx-audio itself fetches the speech tokenizer (mlx-community/S3TokenizerV2, model.safetensors)
-# at its latest revision during --install.
+# Pinned: this TTS model revision, the speech tokenizer below, and the hashed packages in
+# requirements.lock. mlx-audio fetches the tokenizer at its latest revision on its own; load_model
+# then replaces every one of those weights with the pinned file, checked by sha256.
 REVISION = os.environ.get("YAPPER_TTS_REVISION", "b2d0a13aa7cfff0a06d9acb247ae91c8f19a6d75")
+S3TOK_REPO, S3TOK_FILE = "mlx-community/S3TokenizerV2", "model.safetensors"
+S3TOK_REVISION = "e0c9886f0e1c35ae85b1f27277416fb19fc72bec"
+S3TOK_SHA256 = "928726bc1f206a613d36b8f49e297eae9c5593a21bf9b92ddfe2c23f85eb92cc"
 VOICE_WAV = os.environ.get("YAPPER_TTS_VOICE_WAV", os.path.join(ROOT, "voices", "derry_b.wav"))
 MAX_BODY = 64 * 1024  # largest accepted request body, bytes
 MAX_CHARS = 600       # longest text spoken per request, as in bin/speak-hook
 REQUEST_TIMEOUT_S = 5
 SPEED = float(os.environ.get("YAPPER_TTS_SPEED", "1.07"))
+
+
+def pinned_tokenizer_path(download=None):
+    """Fetch (or find in the cache) the speech tokenizer at its pinned revision; refuse a wrong hash."""
+    if download is None:
+        from huggingface_hub import hf_hub_download as download
+    path = download(repo_id=S3TOK_REPO, filename=S3TOK_FILE, revision=S3TOK_REVISION)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != S3TOK_SHA256:
+        raise RuntimeError(f"speech tokenizer sha256 {h.hexdigest()[:16]} != pinned {S3TOK_SHA256[:16]}; "
+                           f"rerun yapper --install ({path})")
+    return path
 
 
 class ChatterboxEngine:
@@ -117,6 +135,14 @@ class ChatterboxEngine:
     def load_model(self):
         from mlx_audio.tts.utils import load_model
         self.model = load_model(self.model_id, revision=self.revision)
+        import mlx.core as mx
+        tok = self.model._s3tokenizer
+        weights = mx.load(pinned_tokenizer_path())
+        if hasattr(tok, "sanitize"):
+            weights = tok.sanitize(weights)
+        tok.load_weights(list(weights.items()), strict=True)   # every tokenizer weight from the pinned file
+        mx.eval(tok.parameters())
+        log.info("speech tokenizer pinned at %s@%s (sha256 checked)", S3TOK_REPO, S3TOK_REVISION[:8])
 
     def set_voice(self, voice_wav):
         """Fix the voice from one reference clip; lib/sample.py calls this once per clip."""
