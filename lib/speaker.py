@@ -109,18 +109,34 @@ REQUEST_TIMEOUT_S = 5
 SPEED = float(os.environ.get("YAPPER_TTS_SPEED", "1.07"))
 
 
-def pinned_tokenizer_path(download=None):
-    """Fetch (or find in the cache) the speech tokenizer at its pinned revision; refuse a wrong hash."""
-    if download is None:
-        from huggingface_hub import hf_hub_download as download
-    path = download(repo_id=S3TOK_REPO, filename=S3TOK_FILE, revision=S3TOK_REVISION)
+def _sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    if h.hexdigest() != S3TOK_SHA256:
-        raise RuntimeError(f"speech tokenizer sha256 {h.hexdigest()[:16]} != pinned {S3TOK_SHA256[:16]}; "
-                           f"rerun yapper --install ({path})")
+    return h.hexdigest()
+
+
+def pinned_tokenizer_path(download=None):
+    """Fetch (or find in the cache) the speech tokenizer at its pinned revision; refuse a wrong hash.
+
+    A commit pin is served from the cache without downloading again, so a bad cached file is
+    fetched once more with force_download (online, as in --install) before refusing."""
+    if download is None:
+        from huggingface_hub import hf_hub_download as download
+    kw = dict(repo_id=S3TOK_REPO, filename=S3TOK_FILE, revision=S3TOK_REVISION)
+    path = download(**kw)
+    got = _sha256(path)
+    if got != S3TOK_SHA256:
+        log.warning("speech tokenizer %s has sha256 %s; fetching it again", path, got[:16])
+        try:
+            fresh = download(force_download=True, **kw)
+            path, got = fresh, _sha256(fresh)
+        except Exception as e:          # noqa: BLE001  offline (the engine) or no network
+            log.warning("could not fetch the speech tokenizer again: %s", e)
+    if got != S3TOK_SHA256:
+        raise RuntimeError(f"speech tokenizer sha256 {got[:16]} != pinned {S3TOK_SHA256[:16]}; "
+                           f"rerun yapper --install online ({path})")
     return path
 
 

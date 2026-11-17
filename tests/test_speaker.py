@@ -231,41 +231,58 @@ sp.release(srv, SOCK)
 check(not os.path.exists(SOCK), "a clean shutdown removes the socket")
 os.rmdir(SOCK_DIR)
 
-# --- the speech tokenizer is fetched at its pinned revision and refused on a wrong hash
+# --- the speech tokenizer is fetched at its pinned revision, fetched once more on a wrong hash, then refused
 import hashlib
 import speaker as spk
-calls = []
+calls, made = [], []
 
 
-def fake_download(body):
+def fake_download(*bodies, fail_force=False):
+    """Returns each body in turn (the last one repeats); with fail_force, a force_download call raises."""
+    seq = list(bodies)
+
     def dl(**kw):
-        calls.append(kw)
+        calls.append(dict(kw))
+        if fail_force and kw.get("force_download"):
+            raise OSError("offline")
         fd, p = tempfile.mkstemp(suffix=".safetensors")
-        os.write(fd, body)
+        os.write(fd, seq.pop(0) if len(seq) > 1 else seq[0])
         os.close(fd)
-        kw["_path"] = p
+        made.append(p)
         return p
     return dl
 
 
+PIN = {"repo_id": spk.S3TOK_REPO, "filename": spk.S3TOK_FILE, "revision": spk.S3TOK_REVISION}
 real = spk.S3TOK_SHA256
 spk.S3TOK_SHA256 = hashlib.sha256(b"weights").hexdigest()
 try:
+    calls.clear()
     p = spk.pinned_tokenizer_path(fake_download(b"weights"))
-    check({k: v for k, v in calls[-1].items() if k != "_path"} == {"repo_id": spk.S3TOK_REPO, "filename": spk.S3TOK_FILE, "revision": spk.S3TOK_REVISION},
-          f"tokenizer fetched at the pinned revision {calls[-1]}")
+    check(calls == [PIN], f"a good cached file is used as is, one fetch at the pinned revision {calls}")
     check(open(p, "rb").read() == b"weights", "the matching file is returned")
-    os.unlink(p)
-    try:
-        spk.pinned_tokenizer_path(fake_download(b"tampered"))
-        check(False, "a wrong sha256 raises")
-    except RuntimeError as e:
-        check(str(e)[:160].count(" != pinned ") == 1 and "--install" in str(e)[:160],
-              f"the refusal keeps both hashes and the fix within the 160-char status {str(e)[:160]}")
-    finally:
-        os.unlink(calls[-1]["_path"]) if "_path" in calls[-1] else None
+
+    calls.clear()
+    p = spk.pinned_tokenizer_path(fake_download(b"corrupt", b"weights"))
+    check(calls == [PIN, dict(PIN, force_download=True)], f"a bad cached file is fetched once more with force_download {calls}")
+    check(open(p, "rb").read() == b"weights", "the re-fetched good file is returned")
+
+    for label, dl in (("still bad after the re-fetch", fake_download(b"tampered")),
+                      ("re-fetch impossible offline", fake_download(b"tampered", fail_force=True))):
+        calls.clear()
+        try:
+            spk.pinned_tokenizer_path(dl)
+            check(False, f"{label}: raises")
+        except RuntimeError as e:
+            s = str(e)[:160]
+            check(s.count(" != pinned ") == 1 and "rerun yapper --install online" in s,
+                  f"{label}: refusal keeps both hashes and the fix within the 160-char status {s}")
+        check(len(calls) == 2, f"{label}: exactly one re-fetch {calls}")
 finally:
     spk.S3TOK_SHA256 = real
+    for q in made:
+        if os.path.exists(q):
+            os.unlink(q)
 check(len(spk.S3TOK_REVISION) == 40 and len(spk.S3TOK_SHA256) == 64, "revision and hash are full-length pins")
 
 # --- load_model swaps every tokenizer weight for the pinned file (fake mlx and mlx-audio)
