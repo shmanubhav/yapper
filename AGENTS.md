@@ -2,8 +2,8 @@
 
 ## What this repo is
 Spoken Claude Code replies on an Apple Silicon Mac: `bin/yapper` starts Claude Code with `voice-settings.json`, whose two hooks inject the `<speak>` instruction each turn and send the reply's `<speak>` block to a local Chatterbox Turbo (MLX) speech server.
-Speech is made and played on this Mac only. Speech-to-text is OpenSuperWhisper, a separate, optional app.
-Launcher `bin/yapper`; hooks `bin/voice-brief` (UserPromptSubmit) and `bin/speak-hook` (Stop); server `lib/speaker.py` via `bin/tts-server`; voice trial `lib/sample.py` (`yapper --sample`); setup wizard `lib/wizard.py` (`yapper --setup`, interactive only; reads voice tags from the `## Voices` bullets in `voices/README.md`); mic watcher `lib/micwatch.py`; sentence split `lib/sentences.py`.
+Speech is made on this Mac and played here, or, only when the user runs `yapper --remote` from another Mac, on that Mac over the user's own SSH connection. Speech-to-text is OpenSuperWhisper, a separate, optional app.
+Launcher `bin/yapper`; hooks `bin/voice-brief` (UserPromptSubmit) and `bin/speak-hook` (Stop); server `lib/speaker.py` via `bin/tts-server`; voice trial `lib/sample.py` (`yapper --sample`); setup wizard `lib/wizard.py` (`yapper --setup`, interactive only; reads voice tags from the `## Voices` bullets in `voices/README.md`); mic watcher `lib/micwatch.py`; sentence split `lib/sentences.py`; remote player `lib/player.py` (`yapper --remote`).
 
 ## Validate locally
 - `for t in tests/test_*.py; do python3 -I "$t" || echo "FAIL $t"; done`: stdlib scripts against stubs and fakes; none start the speech engine, load the model or play sound. Keep it that way.
@@ -18,6 +18,7 @@ Launcher `bin/yapper`; hooks `bin/voice-brief` (UserPromptSubmit) and `bin/speak
 - The allowed emotion tags live in both `speak-hook` and `voice-brief` and must match (`tests/test_brief.py`); an unknown tag would be read aloud, so it is dropped.
 - Claude Code keeps only the last `--settings` flag, so the launcher refuses a caller's `--settings`.
 - The engine and mic watcher are tracked by pidfiles next to the socket (`speech.sock.speaker.pid`, `speech.sock.micwatch.pid`); `--stop` kills a pid only while its command line still runs this clone's `lib/` script, and never searches by pattern. With no pidfile, nothing is killed.
+- Remote voice is opt-in: with no player registered through `POST /player`, every clip plays on this Mac. A player that cannot be reached is dropped and the clip plays here; `yapper --remote` registers again every 5 seconds while its connection lasts.
 - `/health` returns this clone's root; the launcher refuses an engine on its socket whose root differs.
 - The launcher runs under `umask 077`; `speak-hook` creates `speak.log` as 600.
 - The config file is parsed line by line with strict patterns, never sourced or evaluated.
@@ -34,7 +35,7 @@ Launcher `bin/yapper`; hooks `bin/voice-brief` (UserPromptSubmit) and `bin/speak
 - The voices in `voices/` are synthetic, not real people (`voices/README.md` records where each came from).
 
 ## Never do
-- Never turn on built-in dictation in `voice-settings.json` or let audio leave the Mac.
+- Never turn on built-in dictation in `voice-settings.json` or let audio leave the Mac, except to a player the user registered with `yapper --remote`, over a Unix socket forwarded by their own SSH connection.
 - Never let a hook block a turn, print to stdout from `speak-hook`, or make a network call without a short timeout.
 - Never unpin the TTS model revision or add a package to `requirements.lock` without its hash.
 - Never commit recorded speech or a real person's voice.

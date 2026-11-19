@@ -144,6 +144,55 @@ if [ "${1-}" = "--config" ]; then
   exit 0
 fi
 
+# --remote HOST [COMMAND...]: from a laptop, SSH to the Mac that runs the engine and hear its
+# replies here (opt-in). For the life of the connection this Mac runs lib/player.py and the mic
+# watcher. SSH reverse-forwards the player's socket next to the engine's socket on HOST, and
+# forwards the engine's socket here, so this Mac's mic cuts speech the way the desk's mic does.
+# Both are Unix sockets in private folders: no network port is opened on either Mac. The laptop
+# needs python3, ssh and curl, not the speech environment.
+SOCK_PATH_RE='^/[A-Za-z0-9._/+-]+\.sock$'
+remote(){
+  local host="$1" id d rsock rengine why rc
+  shift
+  command -v ssh >/dev/null || die "--remote needs ssh"
+  command -v python3 >/dev/null || die "--remote needs python3: xcode-select --install"
+  load_config     # this Mac's speed setting plays the clips
+  d="$C/remote"; mkdir -p "$d" || die "could not create $d"
+  why="$(sock_problem "$d/x.sock")"; [ -z "$why" ] || die "$why"
+  id="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"   # fresh names per connection: a dropped one never blocks the next
+  # Globals, not locals: the EXIT trap runs after this function has returned.
+  lsock="$d/p-$id.sock"; esock="$d/e-$id.sock"; pids=()
+  # One short login asks HOST where its engine listens (YAPPER_SOCKET there, else the default).
+  rengine="$(ssh -o ConnectTimeout=5 "$host" 'printf %s "${YAPPER_SOCKET:-$HOME/.cache/yapper/speech.sock}"' </dev/null)" \
+    || die "could not reach $host over ssh"
+  [[ "$rengine" =~ $SOCK_PATH_RE ]] || die "$host named an unexpected engine socket: $rengine"
+  rsock="$(dirname "$rengine")/r-$id.sock"
+  [ "${#rsock}" -lt 104 ] || die "the player's socket path on $host is too long: $rsock"
+  python3 "$R/lib/player.py" "$lsock" >>"$C/player.log" 2>&1 & pids+=($!)
+  YAPPER_SOCKET="$esock" python3 "$R/lib/micwatch.py" >>"$C/micwatch-remote.log" 2>&1 & pids+=($!)
+  # Register this player with HOST's engine every 5s, so an engine restart picks it up again.
+  ( body="{\"sock\": \"$rsock\", \"on\": true}"
+    while :; do
+      [ -S "$esock" ] && curl -s -o /dev/null -m 1 --unix-socket "$esock" -X POST "http://localhost/player" \
+        -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+      sleep 5
+    done ) >/dev/null 2>&1 & pids+=($!)
+  trap 'kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null; rm -f "$lsock" "$esock"' EXIT
+  say "remote voice" "$host's replies play here while this connection lasts"
+  ssh -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+      -R "$rsock:$lsock" -L "$esock:$rengine" "$host" "$@"
+  rc=$?
+  # HOST's engine finds the player gone on its next clip and plays there again.
+  [ "$rc" = 255 ] && warn "lost or could not reach $host"
+  return "$rc"
+}
+
+if [ "${1-}" = "--remote" ]; then
+  shift
+  case "${1-}" in ''|-*) die "usage: yapper --remote HOST [COMMAND...]" ;; esac
+  remote "$@"; exit $?
+fi
+
 say "voice settings" "$SETTINGS"
 
 # --install puts `yapper` on the PATH as ~/.local/bin/yapper -> this checkout. It never replaces
