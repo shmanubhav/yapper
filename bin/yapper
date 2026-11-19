@@ -181,12 +181,10 @@ remote(){
               -H 'Content-Type: application/json' -d "{\"sock\": \"$rsock\", \"on\": $1}" 2>/dev/null; }
     last=""
     while kill -0 "$player" 2>/dev/null; do
-      if [ -S "$esock" ]; then
-        code="$(post true)"
-        [ "$code" = "$last" ] || echo "register with $host's engine: HTTP ${code:-none}"
-        last="$code"
-      fi
-      sleep 5
+      code="$(post true)"        # 000: not reachable (yet)
+      [ "$code" = "$last" ] || echo "register with $host's engine: HTTP $code"
+      last="$code"
+      sleep "${YAPPER_REMOTE_REGISTER_S:-5}"
     done
     echo "player exited; unregistering"; post false >/dev/null ) >>"$C/player.log" 2>&1 & pids+=($!)
   trap 'kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null; rm -f "$lsock" "$esock"' EXIT

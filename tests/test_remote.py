@@ -261,16 +261,16 @@ esrv.shutdown(); sp.release(esrv, ESOCK)
 
 
 # --- launcher: yapper --remote HOST forwards both sockets over one SSH connection
-def run_remote(args, engine_path, label, ssh_rc=0, env_extra=None):
+def run_remote(args, engine_path, label, ssh_rc=0, env_extra=None, ssh_s="0.5", player_s="30"):
     tmp = tempfile.mkdtemp(prefix="yp", dir="/tmp")
     stubs = os.path.join(tmp, "stubs")
     os.makedirs(stubs)
     rec = os.path.join(tmp, "rec")
     bodies = {
         # the probe login prints the engine's socket path; the main login records its args
-        "ssh": f'case "$*" in *ConnectTimeout=5*) printf %s "{engine_path}" ;; *) printf "%s\\n" "$@" > {rec}.ssh; sleep 0.5; exit {ssh_rc} ;; esac',
-        "python3": f'echo "$YAPPER_SOCKET $* $$" >> {rec}.py; exec sleep 30',
-        "curl": "exit 0",
+        "ssh": f'case "$*" in *ConnectTimeout=5*) printf %s "{engine_path}" ;; *) printf "%s\\n" "$@" > {rec}.ssh; sleep {ssh_s}; exit {ssh_rc} ;; esac',
+        "python3": f'echo "$YAPPER_SOCKET $* $$" >> {rec}.py; case "$*" in *player.py*) exec sleep {player_s} ;; esac; exec sleep 30',
+        "curl": f'for a; do case "$a" in *sock*on*) echo "$a" >> {rec}.curl ;; esac; done; printf 200',
     }
     for name, body in bodies.items():
         p = os.path.join(stubs, name)
@@ -281,6 +281,7 @@ def run_remote(args, engine_path, label, ssh_rc=0, env_extra=None):
                        capture_output=True, text=True, timeout=30)
     get = lambda s: open(rec + s).read().splitlines() if os.path.exists(rec + s) else []
     out = (r, get(".ssh"), get(".py"), tmp)
+    run_remote.curl = get(".curl")
     return out
 
 
@@ -320,6 +321,12 @@ check(r.returncode == 255 and "lost or could not reach laptop-host" in r.stderr,
 shutil.rmtree(tmp, ignore_errors=True)
 r, sargs, py, tmp = run_remote(["laptop-host"], "/odd; path", "override", env_extra={"YAPPER_REMOTE_SOCKET": "/Users/u/s/speech.sock"})
 check(r.returncode == 0 and any(a.endswith(":/Users/u/s/speech.sock") for a in sargs), "YAPPER_REMOTE_SOCKET names the engine and skips the probe")
+shutil.rmtree(tmp, ignore_errors=True)
+r, sargs, py, tmp = run_remote(["laptop-host"], "/Users/u/.cache/yapper/speech.sock", "reg", ssh_s="2", player_s="0.5",
+                               env_extra={"YAPPER_REMOTE_REGISTER_S": "0.2"})
+c = run_remote.curl
+check(c[:1] and '"on": true' in c[0] and c[-1:] and '"on": false' in c[-1] and sum('"on": false' in x for x in c) == 1,
+      f"registers while the player runs, then unregisters once when it exits {c}")
 shutil.rmtree(tmp, ignore_errors=True)
 r, sargs, py, tmp = run_remote([], "/x.sock", "nohost")
 check(r.returncode != 0 and "usage: yapper --remote HOST" in r.stderr, "--remote needs a host")
