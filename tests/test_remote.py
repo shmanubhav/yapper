@@ -78,7 +78,7 @@ check(oct(os.stat(PSOCK).st_mode & 0o777) == "0o600", "player socket is mode 600
 check(send(PSOCK, wav()) == b"done\n", "a complete clip is answered done")
 check(any(l.startswith("args -r 1.25 -q 1 ") for l in log_lines()), f"afplay ran at this Mac's speed {log_lines()}")
 open(LOG, "w").close()
-check(send(PSOCK, wav()[:-10]) == b"done\n" and log_lines() == [], f"a partial clip is dropped unplayed {log_lines()}")
+check(send(PSOCK, wav()[:-10]) == b"dropped\n" and log_lines() == [], f"a partial clip is dropped unplayed, and not answered done {log_lines()}")
 srv.close(); th.join(2)
 
 srv, th = start_player(PSOCK, play_s="5")
@@ -92,6 +92,30 @@ check(wait_until(lambda: "r" in res, 2) and res["r"] == b"done\n" and time.time(
 check(log_lines()[-1:] == ["end"], f"afplay was stopped {log_lines()}")
 srv.close(); th.join(2)
 check(not os.path.exists(PSOCK), "player removes its socket on close")
+
+# a STOP never cuts a clip that arrived after it
+class FakeConn:
+    def __init__(self, data):
+        self.chunks, self.sent = [data, b""], b""
+
+    def recv(self, n):
+        return self.chunks.pop(0)
+
+    def sendall(self, b):
+        self.sent += b
+
+    def close(self):
+        pass
+
+
+pp = pl.Player(afplay=STUB)
+kills = []
+pp._kill = lambda: kills.append(1)
+pp.playing = 7
+pp.handle(FakeConn(b"STOP"), 6)
+check(kills == [] and pp.stop_below == 6, "STOP 6 leaves clip 7 playing")
+pp.handle(FakeConn(b"STOP"), 8)
+check(kills == [1], "STOP 8 cuts clip 7")
 
 opened = tempfile.mkdtemp(prefix="yp", dir="/tmp")
 os.chmod(opened, 0o755)
@@ -135,6 +159,68 @@ check(local.started == [clipf, clipf] and r.target is None, "player gone: back t
 r.kill()
 check(local.kills == 1, "kill always stops local playback")
 
+
+def rude_server(path, mode):
+    """Accepts clips and then hangs up ("close") or never answers ("stall")."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)
+    s.listen(4)
+    held = []
+
+    def run():
+        while True:
+            try:
+                c, _ = s.accept()
+            except OSError:
+                return
+            if mode == "close":
+                c.close()
+            else:
+                held.append(c)
+    threading.Thread(target=run, daemon=True).start()
+    return s
+
+
+for mode in ("close", "stall"):
+    RS = os.path.join(W, "r-" + mode + ".sock")
+    rs = rude_server(RS, mode)
+    local = FakeLocal()
+    r = sp.RoutedPlayer(local)
+    r.register(RS)
+    old = sp.REMOTE_SLACK_S
+    sp.REMOTE_SLACK_S = 0.5
+    t0 = time.time()
+    r.start(clipf).wait()
+    sp.REMOTE_SLACK_S = old
+    check(local.started == [clipf] and r.target is None and time.time() - t0 < 3,
+          f"player that {mode}s: the clip plays here instead, and the player is dropped ({time.time() - t0:.1f}s)")
+    rs.close()
+
+srv, th = start_player(PSOCK, play_s="5")
+open(LOG, "w").close()
+local = FakeLocal()
+r = sp.RoutedPlayer(local)
+r.register(PSOCK)
+h = r.start(clipf)
+done = threading.Event()
+threading.Thread(target=lambda: (h.wait(), done.set()), daemon=True).start()
+check(wait_until(lambda: any(l.startswith("args") for l in log_lines())), "remote clip playing")
+r.kill()
+fin = done.wait(2)
+check(fin and local.started == [], f"a cut remote clip ends at once and never falls back here (ended={fin} here={local.started})")
+check(r.target == PSOCK, "a cut keeps the player registered")
+check(wait_until(lambda: log_lines()[-1:] == ["end"]), f"the player got STOP {log_lines()}")
+srv.close(); th.join(2)
+
+DEAD = os.path.join(W, "r-dead.sock")
+d = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+d.bind(DEAD)
+d.close()                          # a socket file nobody listens on: an SSH connection that ended
+r = sp.RoutedPlayer(FakeLocal())
+r.register(DEAD)
+r.start(clipf)
+check(r.target is None and not os.path.exists(DEAD), "a dead r- socket is dropped and removed")
+
 try:
     r.register(os.path.join(opened, "p.sock"))
     check(False, "register refuses a socket in an open folder")
@@ -175,14 +261,14 @@ esrv.shutdown(); sp.release(esrv, ESOCK)
 
 
 # --- launcher: yapper --remote HOST forwards both sockets over one SSH connection
-def run_remote(args, engine_path, label):
+def run_remote(args, engine_path, label, ssh_rc=0, env_extra=None):
     tmp = tempfile.mkdtemp(prefix="yp", dir="/tmp")
     stubs = os.path.join(tmp, "stubs")
     os.makedirs(stubs)
     rec = os.path.join(tmp, "rec")
     bodies = {
         # the probe login prints the engine's socket path; the main login records its args
-        "ssh": f'case "$*" in *ConnectTimeout=5*) printf %s "{engine_path}" ;; *) printf "%s\\n" "$@" > {rec}.ssh; sleep 0.5 ;; esac',
+        "ssh": f'case "$*" in *ConnectTimeout=5*) printf %s "{engine_path}" ;; *) printf "%s\\n" "$@" > {rec}.ssh; sleep 0.5; exit {ssh_rc} ;; esac',
         "python3": f'echo "$YAPPER_SOCKET $* $$" >> {rec}.py; exec sleep 30',
         "curl": "exit 0",
     }
@@ -190,7 +276,7 @@ def run_remote(args, engine_path, label):
         p = os.path.join(stubs, name)
         open(p, "w").write(f"#!/bin/sh\n{body}\n")
         os.chmod(p, 0o755)
-    env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": tmp}
+    env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": tmp, **(env_extra or {})}
     r = subprocess.run([os.path.join(ROOT, "bin", "yapper"), "--remote", *args], env=env,
                        capture_output=True, text=True, timeout=30)
     get = lambda s: open(rec + s).read().splitlines() if os.path.exists(rec + s) else []
@@ -228,6 +314,12 @@ shutil.rmtree(tmp, ignore_errors=True)
 
 r, sargs, py, tmp = run_remote(["laptop-host"], "/tmp/x; touch /tmp/pwned", "bad")
 check(r.returncode != 0 and sargs == [] and "unexpected engine socket" in r.stderr, "an odd engine path from the host is refused")
+shutil.rmtree(tmp, ignore_errors=True)
+r, sargs, py, tmp = run_remote(["laptop-host"], "/Users/u/.cache/yapper/speech.sock", "lost", ssh_rc=255)
+check(r.returncode == 255 and "lost or could not reach laptop-host" in r.stderr, f"a dropped connection exits 255 and says so ({r.returncode})")
+shutil.rmtree(tmp, ignore_errors=True)
+r, sargs, py, tmp = run_remote(["laptop-host"], "/odd; path", "override", env_extra={"YAPPER_REMOTE_SOCKET": "/Users/u/s/speech.sock"})
+check(r.returncode == 0 and any(a.endswith(":/Users/u/s/speech.sock") for a in sargs), "YAPPER_REMOTE_SOCKET names the engine and skips the probe")
 shutil.rmtree(tmp, ignore_errors=True)
 r, sargs, py, tmp = run_remote([], "/x.sock", "nohost")
 check(r.returncode != 0 and "usage: yapper --remote HOST" in r.stderr, "--remote needs a host")

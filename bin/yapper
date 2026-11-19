@@ -162,27 +162,41 @@ remote(){
   id="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"   # fresh names per connection: a dropped one never blocks the next
   # Globals, not locals: the EXIT trap runs after this function has returned.
   lsock="$d/p-$id.sock"; esock="$d/e-$id.sock"; pids=()
-  # One short login asks HOST where its engine listens (YAPPER_SOCKET there, else the default).
-  rengine="$(ssh -o ConnectTimeout=5 "$host" 'printf %s "${YAPPER_SOCKET:-$HOME/.cache/yapper/speech.sock}"' </dev/null)" \
-    || die "could not reach $host over ssh"
+  # One short login asks HOST where its engine listens (the default, unless the login shell sets
+  # YAPPER_SOCKET); YAPPER_REMOTE_SOCKET here names it instead and skips that login.
+  rengine="${YAPPER_REMOTE_SOCKET-}"
+  if [ -z "$rengine" ]; then
+    rengine="$(ssh -o ConnectTimeout=5 "$host" 'printf %s "${YAPPER_SOCKET:-$HOME/.cache/yapper/speech.sock}"' </dev/null)" \
+      || die "could not reach $host over ssh"
+  fi
   [[ "$rengine" =~ $SOCK_PATH_RE ]] || die "$host named an unexpected engine socket: $rengine"
   rsock="$(dirname "$rengine")/r-$id.sock"
   [ "${#rsock}" -lt 104 ] || die "the player's socket path on $host is too long: $rsock"
-  python3 "$R/lib/player.py" "$lsock" >>"$C/player.log" 2>&1 & pids+=($!)
+  python3 "$R/lib/player.py" "$lsock" >>"$C/player.log" 2>&1 & pids+=($!); player=$!
   YAPPER_SOCKET="$esock" python3 "$R/lib/micwatch.py" >>"$C/micwatch-remote.log" 2>&1 & pids+=($!)
-  # Register this player with HOST's engine every 5s, so an engine restart picks it up again.
-  ( body="{\"sock\": \"$rsock\", \"on\": true}"
-    while :; do
-      [ -S "$esock" ] && curl -s -o /dev/null -m 1 --unix-socket "$esock" -X POST "http://localhost/player" \
-        -H 'Content-Type: application/json' -d "$body" 2>/dev/null
+  # Register this player with HOST's engine every 5s while it runs, so an engine restart picks it
+  # up again; once it has exited, take it back off, so HOST speaks again. Outcomes go to player.log
+  # (the terminal belongs to the SSH session).
+  ( post(){ curl -s -o /dev/null -w '%{http_code}' -m 1 --unix-socket "$esock" -X POST "http://localhost/player" \
+              -H 'Content-Type: application/json' -d "{\"sock\": \"$rsock\", \"on\": $1}" 2>/dev/null; }
+    last=""
+    while kill -0 "$player" 2>/dev/null; do
+      if [ -S "$esock" ]; then
+        code="$(post true)"
+        [ "$code" = "$last" ] || echo "register with $host's engine: HTTP ${code:-none}"
+        last="$code"
+      fi
       sleep 5
-    done ) >/dev/null 2>&1 & pids+=($!)
+    done
+    echo "player exited; unregistering"; post false >/dev/null ) >>"$C/player.log" 2>&1 & pids+=($!)
   trap 'kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null; rm -f "$lsock" "$esock"' EXIT
   say "remote voice" "$host's replies play here while this connection lasts"
-  ssh -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  local tty=()
+  [ $# -gt 0 ] && [ -t 0 ] && tty=(-t)   # a remote command (yapper, say) still gets a terminal
+  ssh "${tty[@]+"${tty[@]}"}" -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
       -R "$rsock:$lsock" -L "$esock:$rengine" "$host" "$@"
   rc=$?
-  # HOST's engine finds the player gone on its next clip and plays there again.
+  # HOST's engine finds the player gone on its next clip, plays that clip itself, and stays local.
   [ "$rc" = 255 ] && warn "lost or could not reach $host"
   return "$rc"
 }

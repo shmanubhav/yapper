@@ -100,7 +100,12 @@ again. Nothing changes unless you run `--remote`.
 - The laptop needs python3, ssh and curl; it does not need the speech environment or the model.
   `speed` from the laptop's config file sets the playback rate.
 - It logs in twice: once to ask HOST where its engine listens, then for the session. An SSH key
-  saves typing the password twice. Extra words after HOST run as the remote command.
+  saves typing the password twice. If HOST's engine uses its own `YAPPER_SOCKET` that a
+  non-interactive login does not see, set `YAPPER_REMOTE_SOCKET` on the laptop to that path; it
+  also skips the first login. Extra words after HOST run as the remote command, in a terminal:
+  `yapper --remote HOST yapper`.
+- If the laptop's player stops or the connection stalls, HOST plays that clip itself and goes on
+  speaking there; whether registration worked is logged in `player.log`.
 - Both directions are Unix sockets in private folders, carried by that SSH connection
   (`-R` for the audio, `-L` so the laptop's mic reaches HOST's engine). No network port opens
   on either Mac. The forwarded sockets live in `~/.cache/yapper/remote/` on the laptop and next

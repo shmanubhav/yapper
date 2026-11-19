@@ -10,7 +10,7 @@ Served over a Unix socket in a private folder (lib/speechsock.py), never a netwo
 Clips play on this Mac through afplay, unless a remote player is registered (opt-in, yapper --remote):
 then they go to that player's socket, which SSH forwards to the other Mac.
 """
-import hashlib, json, logging, os, queue, signal, socket, stat, subprocess, sys, tempfile, threading
+import hashlib, json, logging, os, queue, signal, socket, stat, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler
 
 import speechsock
@@ -205,41 +205,71 @@ class AfPlayer:
 
 
 REMOTE_CONNECT_S = 1      # reaching a registered player; a dead one falls back to this Mac at once
-REMOTE_CLIP_S = 120       # longest wait for a player to finish one clip
+REMOTE_SLACK_S = 5        # on top of a clip's own length (at half speed), before it counts as stalled
+REMOTE_CLIP_MAX_S = 120   # never wait longer than this for one clip
+
+
+def clip_seconds(data):
+    """Length of a WAV clip from its byte rate (header offset 28); a guess for an odd header."""
+    rate = int.from_bytes(data[28:32], "little") if len(data) >= 44 else 0
+    return max(len(data) - 44, 0) / (rate if rate > 0 else 48000)
 
 
 class RemoteClip:
-    """One clip sent to a remote player: WAV bytes, a half-close, then wait for "done"."""
+    """One clip sent to a remote player: WAV bytes, a half-close, then wait for "done". Anything
+    else (a hang-up, a refusal, a stall past the clip's own length) plays the clip on this Mac."""
 
-    def __init__(self, sock, path, on_fail):
-        self._sock, self._path, self._on_fail = sock, path, on_fail
-        self._closed = False
+    def __init__(self, sock, path, on_fail, fallback):
+        self._sock, self._path = sock, path
+        self._on_fail, self._fallback = on_fail, fallback
+        self.closed = False
 
     def wait(self):
+        failed = False
         try:
-            self._sock.settimeout(REMOTE_CLIP_S)
             with open(self._path, "rb") as f:
-                self._sock.sendall(f.read())
+                data = f.read()
+            deadline = time.monotonic() + min(clip_seconds(data) * 2 + REMOTE_SLACK_S, REMOTE_CLIP_MAX_S)
+
+            def left():
+                t = deadline - time.monotonic()
+                if t <= 0:
+                    raise socket.timeout("the player stalled")
+                return t
+            self._sock.settimeout(left())
+            self._sock.sendall(data)
             self._sock.shutdown(socket.SHUT_WR)
             reply = b""
             while True:
+                self._sock.settimeout(left())
                 b = self._sock.recv(64)
                 if not b:
                     break
                 reply += b
-            if not reply.startswith(b"done") and not self._closed:
-                raise OSError("the player hung up without playing the clip")
+            if not reply.startswith(b"done") and not self.closed:
+                raise OSError(f"the player did not play the clip ({reply.strip()[:20]!r})")
         except OSError as e:
-            if not self._closed:        # a cut closes the socket on purpose
-                log.warning("remote player failed: %s", e)
-                self._on_fail()
+            if not self.closed:         # a cut closes the socket on purpose
+                log.warning("remote player failed: %s; playing this clip here", e)
+                failed = True
         finally:
-            self.close()
+            self.closed = True
+            try:
+                self._sock.close()      # only this thread closes the socket: no fd reuse under a recv
+            except OSError:
+                pass
+        if failed:
+            self._on_fail()
+            h = self._fallback(self)
+            if h:
+                h.wait()
 
     def close(self):
-        self._closed = True
+        """Cut: wakes wait() wherever it blocks. Shutdown only; wait() itself closes the socket, so
+        its fd is never freed (and reused) while that thread may still be about to read it."""
+        self.closed = True
         try:
-            self._sock.close()
+            self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
@@ -283,6 +313,24 @@ class RoutedPlayer:
             raise
         return s
 
+    def _gone(self, path):
+        """The SSH connection that carried this player has ended: drop it, and its leftover socket."""
+        self.unregister(path)
+        if os.path.basename(path).startswith("r-"):
+            try:
+                if stat.S_ISSOCK(os.lstat(path).st_mode) and not speechsock.answers(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+
+    def _fallback(self, clip):
+        """Play a clip the remote player failed, here; unless it was cut meanwhile."""
+        with self._lock:
+            if self._clip is not clip:  # kill() cleared it: this clip was cut
+                return None
+            self._clip = None
+            return self.local.start(clip._path)
+
     def start(self, path):
         target = self.target
         if target:
@@ -290,17 +338,20 @@ class RoutedPlayer:
                 s = self._connect(target, REMOTE_CONNECT_S)
             except (OSError, speechsock.SocketError) as e:
                 log.warning("remote player %s unreachable (%s)", target, e)
-                self.unregister(target)
+                self._gone(target)
             else:
-                self._clip = RemoteClip(s, path, lambda: self.unregister(target))
-                return self._clip
+                clip = RemoteClip(s, path, lambda: self.unregister(target), self._fallback)
+                with self._lock:
+                    self._clip = clip
+                return clip
         return self.local.start(path)
 
     def kill(self):
-        self.local.kill()
-        clip, self._clip = self._clip, None
+        with self._lock:                # a cut clip never falls back after this
+            clip, self._clip = self._clip, None
         if clip:
             clip.close()
+        self.local.kill()
         target = self.target
         if target:
             try:                        # numbered after the clip, so STOP cuts it on the player
@@ -312,7 +363,6 @@ class RoutedPlayer:
                     s.close()
             except (OSError, speechsock.SocketError):
                 pass
-
 
 _state = {"status": "warming", "detail": ""}
 speaker = None
