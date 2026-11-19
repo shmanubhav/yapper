@@ -4,7 +4,8 @@ Every gotcha in AGENTS.md is a review check.
 
 ## What blocks a merge
 - A hook that can block or slow a turn: an unbounded network call or wait, a raised error, or stdout from `speak-hook`.
-- `voice.enabled` or `voiceEnabled` turned on, or any path that sends audio off the Mac.
+- `voice.enabled` or `voiceEnabled` turned on, or any path that sends audio off the Mac other than the opt-in `yapper --remote` player (a Unix socket in a private folder, carried by the user's own SSH connection).
+- Remote voice on by default, a player registered without `check_path`, a TCP forward or listener for it, or a dead player that silences this Mac instead of falling back to it.
 - The emotion tag lists in `speak-hook` and `voice-brief` out of step.
 - An unpinned TTS model revision, a `requirements.lock` entry without hashes, or a pin changed without regenerated hashes.
 - A launcher change that lets a second `--settings` replace `voice-settings.json`.

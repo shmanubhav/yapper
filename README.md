@@ -84,6 +84,35 @@ can do clearly marked.
   in its own short-lived process; a running engine is paused while the samples play and started
   again afterwards. To try only some clips: `yapper --sample derry_b ~/my-voice.wav`.
 
+## Hear replies on another Mac (optional)
+
+Working from a laptop over SSH to the Mac that runs yapper? From a clone of yapper on the
+laptop, connect with:
+
+```
+yapper --remote HOST            # then start yapper on HOST as usual
+```
+
+While that connection lasts, every reply from HOST's engine plays on the laptop instead of on
+HOST, and starting dictation on the laptop cuts it. When the connection ends, HOST speaks
+again. Nothing changes unless you run `--remote`.
+
+- The laptop needs python3, ssh and curl; it does not need the speech environment or the model.
+  `speed` from the laptop's config file sets the playback rate.
+- It logs in twice: once to ask HOST where its engine listens, then for the session. An SSH key
+  saves typing the password twice. If HOST's engine uses its own `YAPPER_SOCKET` that a
+  non-interactive login does not see, set `YAPPER_REMOTE_SOCKET` on the laptop to that path; it
+  also skips the first login. Extra words after HOST run as the remote command, in a terminal:
+  `yapper --remote HOST yapper`.
+- A link needs about 160 kbit/s; a slower one counts as stalled. If the laptop's player stops or
+  the connection stalls, HOST stops the clip on the laptop, plays it itself and goes on speaking there; whether registration worked is logged in `player.log`.
+- Both directions are Unix sockets in private folders, carried by that SSH connection
+  (`-R` for the audio, `-L` so the laptop's mic reaches HOST's engine). No network port opens
+  on either Mac. The forwarded sockets live in `~/.cache/yapper/remote/` on the laptop and next
+  to the engine's socket on HOST.
+- HOST's `sshd` must allow stream-local forwarding (the macOS default does).
+- Logs on the laptop: `~/.cache/yapper/player.log` and `micwatch-remote.log`.
+
 ## Config
 
 Copy `config.example` to `~/.config/yapper/config` (or point `YAPPER_CONFIG` at another file):
@@ -135,7 +164,9 @@ Other optional settings: `YAPPER_SOCKET` (the engine's socket, default
 ## Privacy
 
 - Speech is made and played on this Mac. No audio is sent anywhere, and Claude Code's own
-  cloud dictation stays off in yapper sessions (`voice-settings.json`).
+  cloud dictation stays off in yapper sessions (`voice-settings.json`). The one exception is
+  one you choose: `yapper --remote` carries the audio to your other Mac over your own SSH
+  connection, only while that connection lasts.
 - The speech engine opens no network port. It listens on a private socket
   (`~/.cache/yapper/speech.sock`, in a folder only your account can enter), so other users
   on the Mac cannot make it speak or read the replies sent to it.

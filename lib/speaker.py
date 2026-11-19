@@ -5,10 +5,12 @@ The reference clip voices/derry_b.wav is a synthetic voice designed with Qwen3-T
   GET  /health  -> 503 warming, 200 ready, 500 load failed
   POST /speak   {"text": "..."} -> 202; cuts off anything still playing
   POST /stop    -> stop playback and drop anything queued
+  POST /player  {"sock": "...", "on": true|false} -> 200; route clips to a remote player (yapper --remote)
 Served over a Unix socket in a private folder (lib/speechsock.py), never a network port.
-Clips play on this Mac through afplay.
+Clips play on this Mac through afplay, unless a remote player is registered (opt-in, yapper --remote):
+then they go to that player's socket, which SSH forwards to the other Mac.
 """
-import hashlib, json, logging, os, queue, signal, stat, subprocess, sys, tempfile, threading
+import hashlib, json, logging, os, queue, signal, socket, stat, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler
 
 import speechsock
@@ -202,8 +204,201 @@ class AfPlayer:
                 pass
 
 
+REMOTE_CONNECT_S = 1      # reaching a registered player; a dead one falls back to this Mac at once
+REMOTE_SLACK_S = 5        # on top of a clip's own length (at half speed), before it counts as stalled
+REMOTE_PROGRESS_S = 5     # longest a send to the player may make no progress
+REMOTE_MIN_BPS = 20000    # slowest link supported, bytes per second (160 kbit/s): the transfer's budget
+REMOTE_CLIP_MAX_S = 120   # never wait longer than this for one clip
+
+
+def clip_seconds(data):
+    """Length of a WAV clip from its byte rate (header offset 28); a guess for an odd header."""
+    rate = int.from_bytes(data[28:32], "little") if len(data) >= 44 else 0
+    return max(len(data) - 44, 0) / (rate if rate > 0 else 48000)
+
+
+class RemoteClip:
+    """One clip sent to a remote player: WAV bytes, a half-close, then "got" once the whole clip
+    arrived (transfer budget: the slowest supported link) and "done" once it played (play budget:
+    the clip's own length at half speed, plus slack). Anything else (a hang-up, "dropped", a stall
+    past either budget) stops the clip there and plays it on this Mac."""
+
+    def __init__(self, sock, path, on_fail, fallback):
+        self._sock, self._path = sock, path
+        self._on_fail, self._fallback = on_fail, fallback
+        self.closed = False
+        self._fd_lock = threading.Lock()     # shutdown (cut) and close (wait) never overlap
+
+    def wait(self):
+        failed = False
+        try:
+            with open(self._path, "rb") as f:
+                data = f.read()
+            start = time.monotonic()
+            cap = start + REMOTE_CLIP_MAX_S
+            # The player answers "got" once the whole clip has arrived, then "done" once it played.
+            # The transfer has its own budget (the slowest supported link), so a slow link never
+            # counts against the clip's playing time.
+            got_by = min(start + len(data) / REMOTE_MIN_BPS + REMOTE_SLACK_S, cap)
+            view, sent = memoryview(data), 0
+            while sent < len(data):
+                t = min(REMOTE_PROGRESS_S, got_by - time.monotonic())
+                if t <= 0:
+                    raise socket.timeout("the player stalled taking the clip")
+                self._sock.settimeout(t)            # a send that makes no progress gives up
+                sent += self._sock.send(view[sent:sent + 65536])
+            self._sock.shutdown(socket.SHUT_WR)
+            buf = b""
+
+            def line(by):
+                nonlocal buf
+                while b"\n" not in buf:
+                    t = by - time.monotonic()
+                    if t <= 0:
+                        raise socket.timeout("the player stalled")
+                    self._sock.settimeout(t)
+                    b = self._sock.recv(64)
+                    if not b:
+                        raise OSError("the player hung up")
+                    buf += b
+                first, buf = buf.split(b"\n", 1)
+                return first
+            got = line(got_by)
+            if got != b"got":
+                raise OSError(f"the player did not take the clip ({got[:20]!r})")
+            if line(min(time.monotonic() + clip_seconds(data) * 2 + REMOTE_SLACK_S, cap)) != b"done":
+                raise OSError("the player did not finish the clip")
+        except OSError as e:
+            if not self.closed:         # a cut shuts the socket down on purpose
+                log.warning("remote player failed: %s; playing this clip here", e)
+                failed = True
+        finally:
+            with self._fd_lock:
+                self.closed = True
+                try:
+                    self._sock.close()  # only this thread closes the socket: no fd reuse under a recv
+                except OSError:
+                    pass
+        if failed:
+            self._on_fail()
+            h = self._fallback(self)
+            if h:
+                h.wait()
+
+    def close(self):
+        """Cut: wakes wait() wherever it blocks. Shutdown only; wait() itself closes the socket, so
+        its fd is never freed (and reused) while that thread may still be about to read it."""
+        with self._fd_lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+class RoutedPlayer:
+    """Plays through a registered remote player (yapper --remote) while one is reachable, else
+    through `local`. Opt-in: with nothing registered, every clip plays on this Mac.
+    start() and kill() are called with Speaker's lock held."""
+
+    def __init__(self, local):
+        self.local = local
+        self.target = None
+        self._clip = None
+        self._lock = threading.Lock()
+
+    def register(self, path):
+        """Route clips to the player socket at path; it must sit in a private folder of ours."""
+        speechsock.check_path(path)
+        if not (os.path.lexists(path) and stat.S_ISSOCK(os.lstat(path).st_mode)):
+            raise speechsock.SocketError(f"{path} is not a socket")
+        with self._lock:
+            changed, self.target = self.target != path, path
+        if changed:
+            log.info("speech now plays through the remote player %s", path)
+
+    def unregister(self, path=None):
+        """Back to this Mac; with a path, only if that player is still the one registered."""
+        with self._lock:
+            if self.target is None or (path is not None and path != self.target):
+                return
+            old, self.target = self.target, None
+        log.info("remote player %s gone; speech plays on this Mac again", old)
+
+    def _connect(self, path, timeout):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(speechsock.check_path(path))
+        except (OSError, speechsock.SocketError):
+            s.close()
+            raise
+        return s
+
+    def _gone(self, path):
+        """The SSH connection that carried this player has ended: drop it, and its leftover socket."""
+        self.unregister(path)
+        if os.path.basename(path).startswith("r-"):
+            try:
+                if stat.S_ISSOCK(os.lstat(path).st_mode) and not speechsock.answers(path):
+                    os.unlink(path)
+            except OSError:
+                pass
+
+    def _send_stop(self, target):
+        try:                            # numbered after any clip, so STOP cuts it on the player
+            s = self._connect(target, REMOTE_CONNECT_S)
+            try:
+                s.sendall(b"STOP")
+                s.shutdown(socket.SHUT_WR)
+            finally:
+                s.close()
+        except (OSError, speechsock.SocketError):
+            pass
+
+    def _failed(self, target):
+        """A slow player may still be playing the clip: stop it there before it plays here."""
+        self._send_stop(target)
+        self.unregister(target)
+
+    def _fallback(self, clip):
+        """Play a clip the remote player failed, here; unless it was cut meanwhile."""
+        with self._lock:
+            if self._clip is not clip:  # kill() cleared it: this clip was cut
+                return None
+            self._clip = None
+            return self.local.start(clip._path)
+
+    def start(self, path):
+        target = self.target
+        if target:
+            try:
+                s = self._connect(target, REMOTE_CONNECT_S)
+            except (OSError, speechsock.SocketError) as e:
+                log.warning("remote player %s unreachable (%s)", target, e)
+                self._gone(target)
+            else:
+                clip = RemoteClip(s, path, lambda: self._failed(target), self._fallback)
+                with self._lock:
+                    self._clip = clip
+                return clip
+        return self.local.start(path)
+
+    def kill(self):
+        with self._lock:                # a cut clip never falls back after this
+            clip, self._clip = self._clip, None
+        if clip:
+            clip.close()
+        self.local.kill()
+        target = self.target
+        if target:
+            self._send_stop(target)
+
 _state = {"status": "warming", "detail": ""}
 speaker = None
+router = None             # the RoutedPlayer, once loaded
 
 
 class H(BaseHTTPRequestHandler):
@@ -226,6 +421,27 @@ class H(BaseHTTPRequestHandler):
         if self.headers.get("Origin") is not None:
             return False
         return self.headers.get("Host") == "localhost"
+
+    def _player(self, raw):
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
+            self._send(415, b"json only"); return
+        if router is None:
+            self._send(503, b"warming"); return
+        try:
+            body = json.loads(raw)
+            sock, on = body.get("sock"), body.get("on", True)
+            if not isinstance(sock, str) or not isinstance(on, bool):
+                raise ValueError
+        except (ValueError, AttributeError):
+            self._send(400, b"bad json"); return
+        if not on:
+            router.unregister(sock)
+            self._send(200, b"local"); return
+        try:
+            router.register(sock)
+        except speechsock.SocketError as e:
+            self._send(400, str(e).encode()[:200]); return
+        self._send(200, b"remote")
 
     def do_GET(self):
         if not self._local():
@@ -257,6 +473,8 @@ class H(BaseHTTPRequestHandler):
             if speaker:
                 speaker.stop()
             self._send(200, b"stopped"); return
+        if self.path == "/player":
+            self._player(raw); return
         if self.path != "/speak":
             self._send(404); return
         if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() != "application/json":
@@ -274,10 +492,11 @@ class H(BaseHTTPRequestHandler):
 
 
 def _load(engine):
-    global speaker
+    global speaker, router
     try:
         engine.load()
-        speaker = Speaker(engine.synth, AfPlayer(SPEED))
+        router = RoutedPlayer(AfPlayer(SPEED))
+        speaker = Speaker(engine.synth, router)
         _state.update(status="ready", detail="")
         log.info("speaker ready, model=%s@%s voice=%s speed=%.2f", MODEL, REVISION[:8], VOICE_WAV, SPEED)
     except Exception as e:                      # noqa: BLE001 - reported through /health as 500
