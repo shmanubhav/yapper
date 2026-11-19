@@ -177,6 +177,8 @@ remote(){
   # Register this player with HOST's engine every 5s while it runs, so an engine restart picks it
   # up again; once it has exited, take it back off, so HOST speaks again. Outcomes go to player.log
   # (the terminal belongs to the SSH session).
+  local every="${YAPPER_REMOTE_REGISTER_S:-5}"     # test hook: seconds between registrations
+  [[ "$every" =~ ^[0-9]+(\.[0-9]+)?$ ]] || every=5
   ( post(){ curl -s -o /dev/null -w '%{http_code}' -m 1 --unix-socket "$esock" -X POST "http://localhost/player" \
               -H 'Content-Type: application/json' -d "{\"sock\": \"$rsock\", \"on\": $1}" 2>/dev/null; }
     last=""
@@ -184,7 +186,7 @@ remote(){
       code="$(post true)"        # 000: not reachable (yet)
       [ "$code" = "$last" ] || echo "register with $host's engine: HTTP $code"
       last="$code"
-      sleep "${YAPPER_REMOTE_REGISTER_S:-5}"
+      sleep "$every"
     done
     echo "player exited; unregistering"; post false >/dev/null ) >>"$C/player.log" 2>&1 & pids+=($!)
   trap 'kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null; rm -f "$lsock" "$esock"' EXIT

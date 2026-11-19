@@ -104,8 +104,8 @@ again. Nothing changes unless you run `--remote`.
   non-interactive login does not see, set `YAPPER_REMOTE_SOCKET` on the laptop to that path; it
   also skips the first login. Extra words after HOST run as the remote command, in a terminal:
   `yapper --remote HOST yapper`.
-- If the laptop's player stops or the connection stalls, HOST plays that clip itself and goes on
-  speaking there; whether registration worked is logged in `player.log`.
+- A link needs about 160 kbit/s; a slower one counts as stalled. If the laptop's player stops or
+  the connection stalls, HOST stops the clip on the laptop, plays it itself and goes on speaking there; whether registration worked is logged in `player.log`.
 - Both directions are Unix sockets in private folders, carried by that SSH connection
   (`-R` for the audio, `-L` so the laptop's mic reaches HOST's engine). No network port opens
   on either Mac. The forwarded sockets live in `~/.cache/yapper/remote/` on the laptop and next

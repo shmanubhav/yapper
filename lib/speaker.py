@@ -206,6 +206,8 @@ class AfPlayer:
 
 REMOTE_CONNECT_S = 1      # reaching a registered player; a dead one falls back to this Mac at once
 REMOTE_SLACK_S = 5        # on top of a clip's own length (at half speed), before it counts as stalled
+REMOTE_PROGRESS_S = 5     # longest a send to the player may make no progress
+REMOTE_MIN_BPS = 20000    # slowest link supported, bytes per second (160 kbit/s): the transfer's budget
 REMOTE_CLIP_MAX_S = 120   # never wait longer than this for one clip
 
 
@@ -230,29 +232,42 @@ class RemoteClip:
         try:
             with open(self._path, "rb") as f:
                 data = f.read()
-            cap = time.monotonic() + REMOTE_CLIP_MAX_S
-            deadline = cap
-
-            def left():
-                t = min(deadline, cap) - time.monotonic()
+            start = time.monotonic()
+            cap = start + REMOTE_CLIP_MAX_S
+            # The player answers "got" once the whole clip has arrived, then "done" once it played.
+            # The transfer has its own budget (the slowest supported link), so a slow link never
+            # counts against the clip's playing time.
+            got_by = min(start + len(data) / REMOTE_MIN_BPS + REMOTE_SLACK_S, cap)
+            view, sent = memoryview(data), 0
+            while sent < len(data):
+                t = min(REMOTE_PROGRESS_S, got_by - time.monotonic())
                 if t <= 0:
-                    raise socket.timeout("the player stalled")
-                return t
-            self._sock.settimeout(left())
-            self._sock.sendall(data)                # a slow link gets its own time, inside the cap
+                    raise socket.timeout("the player stalled taking the clip")
+                self._sock.settimeout(t)            # a send that makes no progress gives up
+                sent += self._sock.send(view[sent:sent + 65536])
             self._sock.shutdown(socket.SHUT_WR)
-            deadline = time.monotonic() + clip_seconds(data) * 2 + REMOTE_SLACK_S
-            reply = b""
-            while True:
-                self._sock.settimeout(left())
-                b = self._sock.recv(64)
-                if not b:
-                    break
-                reply += b
-            if not reply.startswith(b"done") and not self.closed:
-                raise OSError(f"the player did not play the clip ({reply.strip()[:20]!r})")
+            buf = b""
+
+            def line(by):
+                nonlocal buf
+                while b"\n" not in buf:
+                    t = by - time.monotonic()
+                    if t <= 0:
+                        raise socket.timeout("the player stalled")
+                    self._sock.settimeout(t)
+                    b = self._sock.recv(64)
+                    if not b:
+                        raise OSError("the player hung up")
+                    buf += b
+                first, buf = buf.split(b"\n", 1)
+                return first
+            got = line(got_by)
+            if got != b"got":
+                raise OSError(f"the player did not take the clip ({got[:20]!r})")
+            if line(min(time.monotonic() + clip_seconds(data) * 2 + REMOTE_SLACK_S, cap)) != b"done":
+                raise OSError("the player did not finish the clip")
         except OSError as e:
-            if not self.closed:         # a cut closes the socket on purpose
+            if not self.closed:         # a cut shuts the socket down on purpose
                 log.warning("remote player failed: %s; playing this clip here", e)
                 failed = True
         finally:

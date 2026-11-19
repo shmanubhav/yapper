@@ -3,7 +3,8 @@
 
 yapper --remote starts this on the laptop and reverse-forwards SOCKET over SSH, so the engine on
 the other Mac can reach it. One connection per clip: WAV bytes, then a half-close; the answer is
-"done" once the clip played or was cut, "dropped" for a clip that never arrived whole. A connection carrying exactly STOP cuts the clip playing
+"got" once it arrived whole, then "done" once it played or was cut; "dropped" for a clip that
+never arrived whole. A connection carrying exactly STOP cuts the clip playing
 now and every clip accepted before it.
 
 Standard library only, Python 3.9 compatible: the laptop needs no speech environment.
@@ -77,6 +78,7 @@ class Player:
                         proc = subprocess.Popen([self.afplay, "-r", str(self.speed), "-q", "1", path],
                                                 start_new_session=True)
                         self.proc, self.playing = proc, n
+            conn.sendall(b"got\n")             # the whole clip arrived: its playing time starts now
             if proc:
                 proc.wait()
             conn.sendall(b"done\n")

@@ -75,7 +75,7 @@ def send(path, data, timeout=5):
 PSOCK = os.path.join(W, "p.sock")
 srv, th = start_player(PSOCK)
 check(oct(os.stat(PSOCK).st_mode & 0o777) == "0o600", "player socket is mode 600")
-check(send(PSOCK, wav()) == b"done\n", "a complete clip is answered done")
+check(send(PSOCK, wav()) == b"got\ndone\n", "a complete clip is answered got, then done")
 check(any(l.startswith("args -r 1.25 -q 1 ") for l in log_lines()), f"afplay ran at this Mac's speed {log_lines()}")
 open(LOG, "w").close()
 check(send(PSOCK, wav()[:-10]) == b"dropped\n" and log_lines() == [], f"a partial clip is dropped unplayed, and not answered done {log_lines()}")
@@ -88,7 +88,7 @@ threading.Thread(target=lambda: res.update(r=send(PSOCK, wav(), timeout=10)), da
 check(wait_until(lambda: any(l.startswith("args") for l in log_lines())), "long clip starts")
 t0 = time.time()
 send(PSOCK, b"STOP")
-check(wait_until(lambda: "r" in res, 2) and res["r"] == b"done\n" and time.time() - t0 < 2, "STOP cuts the playing clip at once")
+check(wait_until(lambda: "r" in res, 2) and res["r"] == b"got\ndone\n" and time.time() - t0 < 2, "STOP cuts the playing clip at once")
 check(log_lines()[-1:] == ["end"], f"afplay was stopped {log_lines()}")
 srv.close(); th.join(2)
 check(not os.path.exists(PSOCK), "player removes its socket on close")
@@ -133,6 +133,7 @@ class FakeLocal:
 
     def start(self, path):
         self.started.append(path)
+        self.at = time.time()
         return type("H", (), {"wait": lambda self: None})()
 
     def kill(self):
@@ -160,12 +161,31 @@ r.kill()
 check(local.kills == 1, "kill always stops local playback")
 
 
-def rude_server(path, mode):
-    """Accepts clips and then hangs up ("close") or never answers ("stall")."""
+def rude_server(path, mode, stops=None):
+    """Accepts clips and then hangs up ("close"), takes them but never answers ("stall"), or
+    never reads them at all ("deaf"). A connection carrying STOP is recorded in stops."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.bind(path)
     s.listen(4)
     held = []
+
+    def one(c):
+        if mode == "close":
+            c.close(); return
+        held.append(c)
+        if mode == "deaf":
+            return
+        data = b""
+        while True:
+            try:
+                b = c.recv(65536)
+            except OSError:
+                return
+            if not b:
+                break
+            data += b
+        if data == b"STOP" and stops is not None:
+            stops.append(time.time())
 
     def run():
         while True:
@@ -173,28 +193,72 @@ def rude_server(path, mode):
                 c, _ = s.accept()
             except OSError:
                 return
-            if mode == "close":
-                c.close()
-            else:
-                held.append(c)
+            threading.Thread(target=one, args=(c,), daemon=True).start()
     threading.Thread(target=run, daemon=True).start()
     return s
 
 
-for mode in ("close", "stall"):
+big = os.path.join(W, "big.wav")
+open(big, "wb").write(wav(4 * 1024 * 1024))     # more than any socket buffer takes
+for mode in ("close", "stall", "deaf"):
     RS = os.path.join(W, "r-" + mode + ".sock")
-    rs = rude_server(RS, mode)
+    stops = []
+    rs = rude_server(RS, mode, stops)
     local = FakeLocal()
     r = sp.RoutedPlayer(local)
     r.register(RS)
-    old = sp.REMOTE_SLACK_S
-    sp.REMOTE_SLACK_S = 0.5
+    sent_stop = []
+    real_stop = r._send_stop
+    r._send_stop = lambda t: (sent_stop.append(time.time()), real_stop(t))
+    old = sp.REMOTE_SLACK_S, sp.REMOTE_PROGRESS_S
+    sp.REMOTE_SLACK_S, sp.REMOTE_PROGRESS_S = 0.5, 0.5
+    f = big if mode == "deaf" else clipf
     t0 = time.time()
-    r.start(clipf).wait()
-    sp.REMOTE_SLACK_S = old
-    check(local.started == [clipf] and r.target is None and time.time() - t0 < 3,
+    r.start(f).wait()
+    sp.REMOTE_SLACK_S, sp.REMOTE_PROGRESS_S = old
+    check(local.started == [f] and r.target is None and time.time() - t0 < 3,
           f"player that {mode}s: the clip plays here instead, and the player is dropped ({time.time() - t0:.1f}s)")
+    if mode == "stall":
+        check(sent_stop and sent_stop[0] <= local.at and wait_until(lambda: stops),
+              f"stall: STOP goes to the player before the clip plays here, and arrives {sent_stop} {stops}")
     rs.close()
+
+# a slow link: the transfer takes far longer than the clip plays, and still counts as played
+SLOW = os.path.join(W, "r-slow.sock")
+ss = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ss.bind(SLOW)
+ss.listen(2)
+
+
+def slow_peer():
+    c, _ = ss.accept()
+    while True:
+        b = c.recv(256 * 1024)
+        if not b:
+            break
+        time.sleep(len(b) / (1024 * 1024))  # about 1 MB/s: 4 MB takes about 4 s
+    c.sendall(b"got\n")
+    time.sleep(0.05)
+    c.sendall(b"done\n")
+    c.close()
+
+
+threading.Thread(target=slow_peer, daemon=True).start()
+fast = os.path.join(W, "fast.wav")         # header says 100 MB/s, so it "plays" in 0.04 s
+hdr = bytearray(wav(4 * 1024 * 1024))
+hdr[28:32] = (100 * 1024 * 1024).to_bytes(4, "little")
+open(fast, "wb").write(bytes(hdr))
+local = FakeLocal()
+r = sp.RoutedPlayer(local)
+r.register(SLOW)
+old = sp.REMOTE_SLACK_S
+sp.REMOTE_SLACK_S = 1
+t0 = time.time()
+r.start(fast).wait()
+sp.REMOTE_SLACK_S = old
+check(time.time() - t0 > 2 and local.started == [] and r.target == SLOW,
+      f"a slow transfer is not a stall: played there, not here ({time.time() - t0:.1f}s)")
+ss.close()
 
 srv, th = start_player(PSOCK, play_s="5")
 open(LOG, "w").close()
@@ -322,7 +386,7 @@ shutil.rmtree(tmp, ignore_errors=True)
 r, sargs, py, tmp = run_remote(["laptop-host"], "/odd; path", "override", env_extra={"YAPPER_REMOTE_SOCKET": "/Users/u/s/speech.sock"})
 check(r.returncode == 0 and any(a.endswith(":/Users/u/s/speech.sock") for a in sargs), "YAPPER_REMOTE_SOCKET names the engine and skips the probe")
 shutil.rmtree(tmp, ignore_errors=True)
-r, sargs, py, tmp = run_remote(["laptop-host"], "/Users/u/.cache/yapper/speech.sock", "reg", ssh_s="2", player_s="0.5",
+r, sargs, py, tmp = run_remote(["laptop-host"], "/Users/u/.cache/yapper/speech.sock", "reg", ssh_s="4", player_s="1.5",
                                env_extra={"YAPPER_REMOTE_REGISTER_S": "0.2"})
 c = run_remote.curl
 check(c[:1] and '"on": true' in c[0] and c[-1:] and '"on": false' in c[-1] and sum('"on": false' in x for x in c) == 1,
