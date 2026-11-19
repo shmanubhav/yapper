@@ -218,8 +218,10 @@ def clip_seconds(data):
 
 
 class RemoteClip:
-    """One clip sent to a remote player: WAV bytes, a half-close, then wait for "done". Anything
-    else (a hang-up, a refusal, a stall past the clip's own length) plays the clip on this Mac."""
+    """One clip sent to a remote player: WAV bytes, a half-close, then "got" once the whole clip
+    arrived (transfer budget: the slowest supported link) and "done" once it played (play budget:
+    the clip's own length at half speed, plus slack). Anything else (a hang-up, "dropped", a stall
+    past either budget) stops the clip there and plays it on this Mac."""
 
     def __init__(self, sock, path, on_fail, fallback):
         self._sock, self._path = sock, path

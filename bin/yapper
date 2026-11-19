@@ -178,7 +178,7 @@ remote(){
   # up again; once it has exited, take it back off, so HOST speaks again. Outcomes go to player.log
   # (the terminal belongs to the SSH session).
   local every="${YAPPER_REMOTE_REGISTER_S:-5}"     # test hook: seconds between registrations
-  [[ "$every" =~ ^[0-9]+(\.[0-9]+)?$ ]] || every=5
+  [[ "$every" =~ ^[0-9]+(\.[0-9]+)?$ && ! "$every" =~ ^[0.]+$ ]] || every=5   # never 0: no busy loop
   ( post(){ curl -s -o /dev/null -w '%{http_code}' -m 1 --unix-socket "$esock" -X POST "http://localhost/player" \
               -H 'Content-Type: application/json' -d "{\"sock\": \"$rsock\", \"on\": $1}" 2>/dev/null; }
     last=""
